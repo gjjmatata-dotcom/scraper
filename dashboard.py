@@ -233,9 +233,11 @@ for tab, (code, info) in zip(tabs, data.items()):
                 disp[c] = Ld[c].apply(fmt) if c in Ld.columns else "-"
             disp["貸借倍率"] = Ld["貸借倍率"].apply(
                 lambda v: "∞" if v==float("inf") else "-" if v!=v else f"{v:.2f}倍")
-            # 最高料率（逆日歩）：値があれば赤字で強調
+            # 最高料率（逆日歩）：列が存在しない場合は "-" で補完
+            if "最高料率" not in Ld.columns:
+                Ld["最高料率"] = float("nan")
             disp["最高料率"] = Ld["最高料率"].apply(
-                lambda v: f"{v:.2f}" if pd.notna(v) and v>0 else "-")
+                lambda v: f"{v:.2f}" if pd.notna(v) and v > 0 else "-")
 
             avg = avg_row_dict(LCOLS, Ld, LNUM, "申込日")
             vr2 = Ld["貸借倍率"].replace([float("inf"),float("-inf")], float("nan"))
