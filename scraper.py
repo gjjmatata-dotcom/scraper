@@ -1,21 +1,20 @@
 """
 scraper.py
-・貸借データ + 逆日歩 : irbank.net/{code}/nisshokin
-・週次信用残           : irbank.net/{code}/margin
-・株価/出来高          : yfinance（過去1ヶ月）
+・貸借: taisyaku.jp（過去1ヶ月）
+・株価: yfinance（過去1ヶ月）
+・信用残: 株探 kabutan.jp（静的HTML・約29週）
 """
-import re, time, requests
+import time, re, requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
-# IRバンクに対して複数のUser-Agentを試みる
-UA_LIST = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-]
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    "Accept-Language": "ja,en-US;q=0.9",
+    "Referer": "https://www.taisyaku.jp/",
+}
 
 STOCKS = {
     "9432": {"name": "NTT",         "yf": "9432.T"},
@@ -24,19 +23,6 @@ STOCKS = {
     "9984": {"name": "SBG",          "yf": "9984.T"},
 }
 
-# 貸借テーブルの必須列（空DataFrame返却時にも保証する）
-LENDING_COLS = ["_dt","申込日","買い残高","買い増減","買い新規","買い返済",
-                "売り残高","売り増減","売り新規","売り返済","貸借倍率","逆日歩"]
-MARGIN_COLS  = ["_dt","日付","買い残高","買い増減","売り残高","売り増減",
-                "信用倍率","逆日歩","買い残増減率","売り残増減率"]
-
-def _empty_lending() -> pd.DataFrame:
-    return pd.DataFrame(columns=LENDING_COLS)
-
-def _empty_margin() -> pd.DataFrame:
-    return pd.DataFrame(columns=MARGIN_COLS)
-
-# ── ユーティリティ ────────────────────────────────────
 def _safe_int_fmt(v) -> str:
     if v is None: return "-"
     try:
@@ -45,237 +31,183 @@ def _safe_int_fmt(v) -> str:
         return f"{int(round(f)):,}"
     except: return "-"
 
-def _to_float(txt: str):
-    s = re.sub(r"[\s,\u3000]", "", str(txt))
-    s = s.replace("▲","-").replace("－","-").replace("＊＊＊＊＊","").strip()
-    if s in ("", "-", "―", "*****", "−"): return None
+def _to_float(txt):
+    s = re.sub(r"[,\s\u3000]", "", str(txt)).replace("▲","-").replace("－","-").strip()
+    if s in ("","-","―","*****"): return None
     try: return float(s)
     except: return None
 
-def _parse_bal_chg(txt: str):
-    """'1,289,600  +198,700' → (残高, 増減)"""
-    parts = txt.strip().split()
-    bal = _to_float(parts[0]) if parts else None
-    chg = _to_float(parts[1]) if len(parts) > 1 else None
-    return bal, chg
+def _is_ymd(txt):
+    if len(txt)==10 and txt[4]=="/" and txt[7]=="/":
+        try: datetime.strptime(txt,"%Y/%m/%d"); return True
+        except: pass
+    return False
 
-def _parse_two(txt: str):
-    """'199,200   500' → (値1, 値2)"""
-    parts = txt.strip().split()
-    v1 = _to_float(parts[0]) if parts else None
-    v2 = _to_float(parts[1]) if len(parts) > 1 else None
-    return v1, v2
+def _expand_table(tbl):
+    rows = tbl.find_all("tr")
+    if not rows: return []
+    mc = max(sum(int(c.get("colspan",1)) for c in r.find_all(["th","td"])) for r in rows)+2
+    R = len(rows)
+    grid     = [[""] * mc for _ in range(R)]
+    occupied = [[False]*mc for _ in range(R)]
+    for ri, row in enumerate(rows):
+        ci = 0
+        for cell in row.find_all(["th","td"]):
+            while ci < mc and occupied[ri][ci]: ci += 1
+            if ci >= mc: break
+            rs,cs = int(cell.get("rowspan",1)), int(cell.get("colspan",1))
+            txt = cell.get_text(strip=True)
+            for dr in range(rs):
+                for dc in range(cs):
+                    r2,c2 = ri+dr, ci+dc
+                    if r2<R and c2<mc: grid[r2][c2]=txt; occupied[r2][c2]=True
+            ci += cs
+    return grid
 
-def _fetch_html(url: str) -> str:
-    """複数UAでリトライしてHTMLを返す。全て失敗したら空文字。"""
-    for ua in UA_LIST:
-        headers = {
-            "User-Agent": ua,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ja,en-US;q=0.9",
-            "Referer": "https://irbank.net/",
-            "Connection": "keep-alive",
-        }
-        for attempt in range(2):
-            try:
-                r = requests.get(url, headers=headers, timeout=25)
-                if r.status_code == 200:
-                    print(f"[OK {url[-30:]}] UA={ua[:30]}")
-                    return r.text
-                print(f"[HTTP {r.status_code}] {url[-30:]} attempt={attempt+1}")
-            except Exception as e:
-                print(f"[エラー] {url[-30:]} : {e} attempt={attempt+1}")
-            time.sleep(1)
-    return ""
+def _parse_html(html) -> list:
+    soup = BeautifulSoup(html,"lxml")
+    tgt = next((t for t in soup.find_all("table")
+                if "融資" in t.get_text() and "差引残高" in t.get_text()), None)
+    if not tgt: return []
+    grid = _expand_table(tgt)
+    # 申込日行を探す
+    date_ri = None; dates = []; dc_start = None
+    for ri, row in enumerate(grid):
+        fd,fc = [],[]
+        for ci,cell in enumerate(row):
+            if _is_ymd(cell): fd.append(cell); fc.append(ci)
+        if len(fd)>=1: date_ri=ri; dates=fd; dc_start=fc[0]; break
+    if not dates: return []
+    n = len(dates)
+    vc = list(range(dc_start, dc_start+n))
+    def gv(row): return [_to_float(row[c]) if c<len(row) else None for c in vc]
+    def fr(k0="",k1="",k2=""):
+        for ri,row in enumerate(grid):
+            if ri==date_ri: continue
+            lbl="".join(row[:4]); c1=row[1] if len(row)>1 else ""; c2=row[2] if len(row)>2 else ""
+            if k0 and k0 not in lbl: continue
+            if k1 and k1 not in (c1+c2): continue
+            if k2 and k2 not in c2: continue
+            v=gv(row)
+            if any(x is not None for x in v): return v
+        return [None]*n
+    yn=fr("融資","新規","新規"); yr=fr("融資","返済","返済"); yb=fr("融資","残高","残高")
+    kn=fr("貸株","新規","新規"); kr=fr("貸株","返済","返済"); kb=fr("貸株","残高","残高")
+    sh=fr("差引残高")
+    recs=[]
+    for i,d in enumerate(dates):
+        dt = datetime.strptime(d,"%Y/%m/%d")
+        recs.append({"_dt":dt,"申込日":dt.strftime("%Y/%m/%d"),
+                     "融資新規":yn[i],"融資返済":yr[i],"融資残高":yb[i],
+                     "貸株新規":kn[i],"貸株返済":kr[i],"貸株残高":kb[i],"差引残高":sh[i]})
+    return recs
 
-def _get_table_rows(html: str, keywords: list) -> list:
-    """keywordsをすべて含むテーブルのtr行リストを返す。"""
-    if not html: return []
-    soup = BeautifulSoup(html, "lxml")
-    for tbl in soup.find_all("table"):
-        if all(kw in tbl.get_text() for kw in keywords):
-            return [[td.get_text(" ", strip=True) for td in tr.find_all(["th","td"])]
-                    for tr in tbl.find_all("tr")]
-    return []
-
-def _parse_yaku(txt: str):
-    """'0.05  1日' → 0.05、'-' → None"""
-    s = txt.strip()
-    if s in ("", "-", "―"): return None
-    m = re.search(r"[\d.]+", s.replace(",",""))
-    return float(m.group()) if m else None
-
-def _rows_to_records(rows: list, ncols_min: int, col_map_fn) -> list:
-    """
-    年ラベル行（4桁数字）から西暦を引き継ぎつつ各行を辞書に変換。
-    col_map_fn(row, dt) -> dict | None
-    """
-    records = []
-    year = datetime.today().year
-    for row in rows:
-        if not row: continue
-        cell0 = row[0].strip()
-        # 年ラベル行
-        if re.fullmatch(r"\d{4}", cell0):
-            year = int(cell0); continue
-        # データ行：M/DD または MM/DD
-        if not re.fullmatch(r"\d{1,2}/\d{2}", cell0): continue
-        if len(row) < ncols_min: continue
-        try:
-            dt = datetime.strptime(f"{year}/{cell0.zfill(5)}", "%Y/%m/%d")
-        except: continue
-        rec = col_map_fn(row, dt)
-        if rec: records.append(rec)
-    return records
-
-
-# ════════════════════════════════════════
-# 貸借データ取得（IRバンク nisshokin）
-# ════════════════════════════════════════
 def fetch_lending(code: str) -> pd.DataFrame:
-    url  = f"https://irbank.net/{code}/nisshokin"
-    html = _fetch_html(url)
-    rows = _get_table_rows(html, ["買い残高", "売り残高", "倍率"])
-
-    if not rows:
-        print(f"[{code}] 貸借テーブル未検出")
-        return _empty_lending()
-
-    def col_map(row, dt):
-        buy_bal, buy_chg = _parse_bal_chg(row[1]) if len(row)>1 else (None,None)
-        buy_new, buy_ret = _parse_two(row[2])      if len(row)>2 else (None,None)
-        sel_bal, sel_chg = _parse_bal_chg(row[3]) if len(row)>3 else (None,None)
-        sel_new, sel_ret = _parse_two(row[4])      if len(row)>4 else (None,None)
-        ratio  = _to_float(row[5]) if len(row)>5 else None
-        yaku   = _parse_yaku(row[6]) if len(row)>6 else None
-        return {
-            "_dt":dt, "申込日":dt.strftime("%Y/%m/%d"),
-            "買い残高":buy_bal, "買い増減":buy_chg,
-            "買い新規":buy_new, "買い返済":buy_ret,
-            "売り残高":sel_bal, "売り増減":sel_chg,
-            "売り新規":sel_new, "売り返済":sel_ret,
-            "貸借倍率":ratio,   "逆日歩":yaku,
-        }
-
-    records = _rows_to_records(rows, 5, col_map)
-    if not records:
-        print(f"[{code}] 貸借レコード0件")
-        return _empty_lending()
-
-    df = pd.DataFrame(records)
-    for c in [c for c in LENDING_COLS if c not in ("_dt","申込日")]:
-        df[c] = pd.to_numeric(df.get(c, float("nan")), errors="coerce")
-    df = df.sort_values("_dt", ascending=True).reset_index(drop=True)
+    today = date.today()
+    cutoff = datetime.combine(today - timedelta(days=35), datetime.min.time())
+    all_recs = []
+    for url in [
+        f"https://www.taisyaku.jp/app/stock/detail/{code}-01?start_date={(today-timedelta(days=35)).strftime('%Y-%m-%d')}&end_date={today.strftime('%Y-%m-%d')}",
+        f"https://www.taisyaku.jp/app/stock/detail/{code}-01",
+    ]:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            all_recs.extend(_parse_html(r.text))
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"[貸借エラー {code}] {e}")
+    if not all_recs: return pd.DataFrame()
+    df = pd.DataFrame(all_recs)
+    df = df.drop_duplicates(subset=["_dt"])
+    df = df[df["_dt"] >= cutoff].sort_values("_dt").reset_index(drop=True)
+    for c in ["融資新規","融資返済","融資残高","貸株新規","貸株返済","貸株残高","差引残高"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    def cr(row):
+        y,k = row["融資残高"],row["貸株残高"]
+        if pd.isna(y) or pd.isna(k): return float("nan")
+        return float("inf") if k==0 else round(y/k,2)
+    df["貸借倍率"] = df.apply(cr, axis=1)
     print(f"[{code}] 貸借: {len(df)}行 {df['申込日'].iloc[0]}〜{df['申込日'].iloc[-1]}")
     return df
 
-
-# ════════════════════════════════════════
-# 週次信用残取得（IRバンク margin）
-# ════════════════════════════════════════
 def fetch_margin(code: str) -> pd.DataFrame:
-    url  = f"https://irbank.net/{code}/margin"
-    html = _fetch_html(url)
-    rows = _get_table_rows(html, ["買い残高", "売り残高", "倍率"])
-
-    if not rows:
-        print(f"[{code}] 信用残テーブル未検出")
-        return _empty_margin()
-
-    def col_map(row, dt):
-        buy_bal, buy_chg = _parse_bal_chg(row[1]) if len(row)>1 else (None,None)
-        _buy_a, _buy_b   = _parse_two(row[2])      if len(row)>2 else (None,None)
-        sel_bal, sel_chg = _parse_bal_chg(row[3]) if len(row)>3 else (None,None)
-        _sel_a, _sel_b   = _parse_two(row[4])      if len(row)>4 else (None,None)
-        ratio = _to_float(row[5]) if len(row)>5 else None
-        yaku  = _parse_yaku(row[6]) if len(row)>6 else None
-        return {
-            "_dt":dt, "日付":dt.strftime("%Y/%m/%d"),
-            "買い残高":buy_bal, "買い増減":buy_chg,
-            "売り残高":sel_bal, "売り増減":sel_chg,
-            "信用倍率":ratio,   "逆日歩":yaku,
-        }
-
-    records = _rows_to_records(rows, 4, col_map)
-    if not records:
-        print(f"[{code}] 信用残レコード0件")
-        return _empty_margin()
-
-    df = pd.DataFrame(records)
-    for c in ["買い残高","買い増減","売り残高","売り増減","信用倍率","逆日歩"]:
-        df[c] = pd.to_numeric(df.get(c, float("nan")), errors="coerce")
-    df = df.sort_values("_dt", ascending=True).reset_index(drop=True)
-    df["買い残増減率"] = df["買い残高"].pct_change() * 100
-    df["売り残増減率"] = df["売り残高"].pct_change() * 100
-    print(f"[{code}] 信用残: {len(df)}件 {df['日付'].iloc[0]}〜{df['日付'].iloc[-1]}")
+    url = f"https://kabutan.jp/stock/kabuka?code={code}&ashi=shin"
+    h = {**HEADERS, "Referer":"https://kabutan.jp/"}
+    try:
+        r = requests.get(url, headers=h, timeout=20); r.raise_for_status()
+    except Exception as e:
+        print(f"[信用残エラー {code}] {e}"); return pd.DataFrame()
+    soup = BeautifulSoup(r.text,"lxml")
+    tgt = next((t for t in soup.find_all("table")
+                if "売り残" in t.get_text() and "買い残" in t.get_text()), None)
+    if not tgt: return pd.DataFrame()
+    recs=[]
+    for tr in tgt.find_all("tr"):
+        cells=[td.get_text(strip=True) for td in tr.find_all(["th","td"])]
+        if len(cells)<8 or not re.match(r"\d{2}/\d{2}/\d{2}",cells[0]): continue
+        yr=2000+int(cells[0][:2])
+        dt=datetime(yr,int(cells[0][3:5]),int(cells[0][6:8]))
+        recs.append({"_dt":dt,"日付":dt.strftime("%Y/%m/%d"),
+                     "終値":_to_float(cells[1]),"前週比率":_to_float(cells[2]),
+                     "売買高":_to_float(cells[4]),"売り残":_to_float(cells[5]),
+                     "買い残":_to_float(cells[6]),"信用倍率":_to_float(cells[7])})
+    if not recs: return pd.DataFrame()
+    df = pd.DataFrame(recs)
+    for c in ["終値","前週比率","売買高","売り残","買い残","信用倍率"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.sort_values("_dt").reset_index(drop=True)
+    df["買い残増減率"] = df["買い残"].pct_change()*100
+    df["売り残増減率"] = df["売り残"].pct_change()*100
+    print(f"[{code}] 信用残: {len(df)}週")
     return df
 
-
-# ════════════════════════════════════════
-# 株価・出来高（yfinance・過去1ヶ月）
-# ════════════════════════════════════════
-def fetch_price(ticker: str, days: int = 35) -> pd.DataFrame:
-    end = datetime.today(); start = end - timedelta(days=days)
+def fetch_price(ticker: str, days: int=35) -> pd.DataFrame:
+    end=datetime.today(); start=end-timedelta(days=days)
     try:
-        df = yf.Ticker(ticker).history(
-            start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"),
-            interval="1d", auto_adjust=True)
+        df=yf.Ticker(ticker).history(start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),interval="1d",auto_adjust=True)
     except Exception as e:
         print(f"[株価エラー {ticker}] {e}"); return pd.DataFrame()
     if df.empty: return pd.DataFrame()
-
-    df = df.reset_index()
-    dc = "Date" if "Date" in df.columns else "Datetime"
-    df["_dt"] = pd.to_datetime(df[dc])
-    df["日付"] = df["_dt"].dt.strftime("%Y/%m/%d")
-    df = df.rename(columns={"Open":"始値","High":"高値","Low":"安値",
-                             "Close":"終値","Volume":"出来高"})
+    df=df.reset_index()
+    dc="Date" if "Date" in df.columns else "Datetime"
+    df["_dt"]=pd.to_datetime(df[dc])
+    df["日付"]=df["_dt"].dt.strftime("%Y/%m/%d")  # ← 西暦付き
+    df=df.rename(columns={"Open":"始値","High":"高値","Low":"安値","Close":"終値","Volume":"出来高"})
     for c in ["始値","高値","安値","終値","出来高"]:
-        if c not in df.columns: df[c] = float("nan")
-    df = df[["_dt","日付","始値","高値","安値","終値","出来高"]].reset_index(drop=True)
+        if c not in df.columns: df[c]=float("nan")
+    df=df[["_dt","日付","始値","高値","安値","終値","出来高"]].reset_index(drop=True)
+    df["前日比%"]=df["終値"].pct_change()*100
+    vm=df["出来高"].mean()
+    df["出来高平均"]=vm
+    df["日中幅"]=df["高値"]-df["安値"]
+    rm=df["日中幅"].rolling(5,min_periods=1).mean().shift(1).fillna(df["日中幅"].mean())
+    vol=df["出来高"]; ret=df["前日比%"].abs()
+    df["機関異常"]=(((vol>vm*2.0)&(ret>=1.5))|(ret>=4.0)&(vol>vm*1.5)|(df["日中幅"]>rm*2.0))
+    df["出来高異常"]=vol>vm*2.0
+    # 降順（直近が上）
+    df=df.sort_values("_dt",ascending=False).reset_index(drop=True)
+    return df
 
-    df["前日比%"]   = df["終値"].pct_change() * 100
-    vm = df["出来高"].mean()
-    df["出来高平均"] = vm
-    df["日中幅"]    = df["高値"] - df["安値"]
-    rm = df["日中幅"].rolling(5,min_periods=1).mean().shift(1).fillna(df["日中幅"].mean())
-    vol = df["出来高"]; ret = df["前日比%"].abs()
-    df["機関異常"]   = ((vol>vm*2.0)&(ret>=1.5)) | ((ret>=4.0)&(vol>vm*1.5)) | (df["日中幅"]>rm*2.0)
-    df["出来高異常"]  = vol > vm*2.0
-    return df.sort_values("_dt", ascending=False).reset_index(drop=True)
-
-
-# ════════════════════════════════════════
-# 買い/売り圧力判定
-# ════════════════════════════════════════
-def judge_pressure(lending: pd.DataFrame, price: pd.DataFrame) -> dict:
-    if lending.empty or "貸借倍率" not in lending.columns or price.empty:
+def judge_pressure(lending, price):
+    if lending.empty or price.empty:
         return {"label":"データ不足","detail":"-","color":"gray"}
-    pc = price["終値"].iloc[0] - price["終値"].iloc[-1]
-    r  = lending["貸借倍率"].iloc[-1]
-    lr = 0.0 if (r!=r or abs(r)==float("inf")) else r
-    if pc<0 and lr<1: return {"label":"🔴 売り圧力優勢","detail":"株価下落＋売り残高>買い残高","color":"#f85149"}
-    if pc>0 and lr>2: return {"label":"🟢 買い圧力優勢","detail":"株価上昇＋買い残高大","color":"#3fb950"}
-    if pc<0 and lr>2: return {"label":"🟠 高値売り圧力","detail":"株価下落＋買い残多（高値圏）","color":"#d29922"}
-    if pc>0 and lr<1: return {"label":"🔵 安値買い戻し","detail":"株価上昇＋売り残多（買い戻し）","color":"#388bfd"}
+    pc=price["終値"].iloc[0]-price["終値"].iloc[-1]
+    r=lending["貸借倍率"].iloc[-1]; lr=0.0 if r!=r else r
+    if pc<0 and lr<1:  return {"label":"🔴 売り圧力優勢","detail":"株価下落＋貸株残高>融資残高","color":"#f85149"}
+    if pc>0 and lr>2:  return {"label":"🟢 買い圧力優勢","detail":"株価上昇＋融資残高大","color":"#3fb950"}
+    if pc<0 and lr>2:  return {"label":"🟠 高値売り圧力","detail":"株価下落＋融資多（高値圏）","color":"#d29922"}
+    if pc>0 and lr<1:  return {"label":"🔵 安値買い戻し","detail":"株価上昇＋貸株多（買い戻し）","color":"#388bfd"}
     return {"label":"⚪ 中立","detail":"方向性なし","color":"#8b949e"}
 
-
-# ════════════════════════════════════════
-# 全銘柄まとめて取得
-# ════════════════════════════════════════
 def fetch_all() -> dict:
-    result = {}
-    for code, info in STOCKS.items():
+    result={}
+    for code,info in STOCKS.items():
         print(f"\n{'='*40}\n{code} {info['name']}")
-        l = fetch_lending(code); time.sleep(2)
-        p = fetch_price(info["yf"]); time.sleep(1)
-        m = fetch_margin(code); time.sleep(2)
-        result[code] = {
-            "name":     info["name"],
-            "lending":  l,
-            "price":    p,
-            "margin":   m,
-            "pressure": judge_pressure(l, p),
-        }
+        l=fetch_lending(code); time.sleep(1)
+        p=fetch_price(info["yf"]); time.sleep(1)
+        m=fetch_margin(code); time.sleep(1)
+        result[code]={"name":info["name"],"lending":l,"price":p,
+                      "margin":m,"pressure":judge_pressure(l,p)}
     return result
