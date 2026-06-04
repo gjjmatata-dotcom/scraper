@@ -47,6 +47,14 @@ def fmt(v, dec=0, suffix=""):
         return s + suffix
     except: return "-"
 
+def fmt_pct(v, dec=1):
+    """パーセント表示（±付き）"""
+    try:
+        f = float(v)
+        if f != f: return "-"
+        return f"{f:+.{dec}f}%"
+    except: return "-"
+
 # ── サイドバー ────────────────────────────────────────
 try: ip = socket.gethostbyname(socket.gethostname())
 except: ip = "取得失敗"
@@ -111,6 +119,24 @@ def cell_style(disp, raw, dcol, num_cols, neg_red=None, thr=3.0):
 
 
 # ════════════════════════════════════════
+# ヘルパー：最新週次信用残の残高を取得
+# ════════════════════════════════════════
+def get_latest_margin_bal(M: pd.DataFrame):
+    """
+    最新の週次信用残の買い残高・売り残高を返す。
+    週次は貸借の日付より古い場合があるため、
+    貸借日付に最も近い（以前の）週次データを使う。
+    """
+    if M.empty: return None, None
+    Msort = M.sort_values("_dt", ascending=False)
+    buy = Msort["買い残高"].dropna()
+    sel = Msort["売り残高"].dropna()
+    latest_buy = buy.iloc[0] if not buy.empty else None
+    latest_sel = sel.iloc[0] if not sel.empty else None
+    return latest_buy, latest_sel
+
+
+# ════════════════════════════════════════
 # 銘柄タブ
 # ════════════════════════════════════════
 tabs = st.tabs([f"{code} {STOCKS[code]['name']}" for code in STOCKS])
@@ -120,6 +146,9 @@ for tab, (code, info) in zip(tabs, data.items()):
     pr = info["pressure"]
     col = COLORS.get(code, "#388bfd")
     prc = PR_COLORS.get(pr["label"], "#8b949e")
+
+    # 最新週次信用残の残高（貸借テーブルの比率計算に使用）
+    latest_margin_buy, latest_margin_sel = get_latest_margin_bal(M)
 
     with tab:
         # 圧力バナー
@@ -134,7 +163,16 @@ for tab, (code, info) in zip(tabs, data.items()):
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         st.markdown("<h3 style='color:#f0f6fc;font-size:14px;margin:0 0 4px'>"
                     "① 貸借取引残高 + 逆日歩（直近順）</h3>", unsafe_allow_html=True)
-        st.caption("🔴赤=差引マイナス ／ 🟡橙=平均3倍超 ／ 🟠逆日歩発生 ／ 青=プラス・赤=マイナス")
+
+        # 信用残との比率の説明
+        if latest_margin_buy and latest_margin_sel:
+            st.caption(
+                f"🔴赤=差引マイナス ／ 🟡橙=平均3倍超 ／ 🟠逆日歩発生 ／ 青=プラス・赤=マイナス\n"
+                f"買い残高(信用%)・売り残高(信用%)：最新週次信用残（買い:{int(latest_margin_buy):,} / "
+                f"売り:{int(latest_margin_sel):,}）に占める日次貸借残高の割合"
+            )
+        else:
+            st.caption("🔴赤=差引マイナス ／ 🟡橙=平均3倍超 ／ 🟠逆日歩発生 ／ 青=プラス・赤=マイナス")
 
         if L.empty:
             st.warning("貸借データを取得できませんでした。")
@@ -148,7 +186,6 @@ for tab, (code, info) in zip(tabs, data.items()):
                                 "資金フロー（買い新規－売り新規）"],
                 specs=[[{"secondary_y": True}], [{"secondary_y": False}]])
 
-            # 買い残高・売り残高
             fig1.add_trace(go.Scatter(x=La["申込日"], y=La["買い残高"], name="買い残高",
                 line=dict(color="#388bfd", width=2), fill="tozeroy",
                 fillcolor="rgba(56,139,253,0.08)",
@@ -160,7 +197,6 @@ for tab, (code, info) in zip(tabs, data.items()):
                 hovertemplate="%{x}<br>売り残高:%{y:,.0f}<extra></extra>"),
                 row=1, col=1, secondary_y=False)
 
-            # 株価ラインを右軸に重ねる
             if not P.empty:
                 Pa_asc = P.sort_values("_dt", ascending=True)
                 fig1.add_trace(go.Scatter(x=Pa_asc["日付"], y=Pa_asc["終値"], name="株価",
@@ -171,7 +207,6 @@ for tab, (code, info) in zip(tabs, data.items()):
                     gridcolor="#21262d", tickfont=dict(color="#e3b341", size=9),
                     tickformat=",", row=1, col=1)
 
-            # 資金フロー
             flow = La["買い新規"].fillna(0) - La["売り新規"].fillna(0)
             fig1.add_trace(go.Bar(x=La["申込日"], y=flow, name="資金フロー",
                 marker_color=["#388bfd" if v >= 0 else "#f85149" for v in flow],
@@ -180,12 +215,11 @@ for tab, (code, info) in zip(tabs, data.items()):
                 row=2, col=1)
             fig1.add_hline(y=0, line_dash="solid", line_color="#484f58",
                            line_width=1, row=2, col=1)
-
             fig_base(fig1, 400); st.plotly_chart(fig1, use_container_width=True)
 
-            # テーブル（貸借倍率を含む・直近が上）
-            LCOLS = ["申込日","買い残高","買い増減","買い新規","買い返済",
-                     "売り残高","売り増減","売り新規","売り返済","貸借倍率","逆日歩"]
+            # テーブル
+            LCOLS = ["申込日","買い残高","買い残高(信用%)","買い増減","買い新規","買い返済",
+                     "売り残高","売り残高(信用%)","売り増減","売り新規","売り返済","貸借倍率","逆日歩"]
             LNUM  = ["買い残高","買い増減","買い新規","買い返済",
                      "売り残高","売り増減","売り新規","売り返済"]
             Ld = L.sort_values("_dt", ascending=False).reset_index(drop=True)
@@ -193,17 +227,48 @@ for tab, (code, info) in zip(tabs, data.items()):
 
             dp = pd.DataFrame()
             dp["申込日"] = Ld["申込日"]
-            for c in LNUM: dp[c] = Ld[c].apply(fmt) if c in Ld.columns else "-"
+
+            # 買い残高（＋信用残に対する%）
+            def fmt_with_pct(val, base):
+                """残高と信用残に対する%を '1,234,567 (12.3%)' の形式で返す"""
+                v_str = fmt(val)
+                if v_str == "-": return "-"
+                if base and pd.notna(base) and base > 0:
+                    pct = float(val) / base * 100
+                    return f"{v_str}\n({pct:.1f}%)"
+                return v_str
+
+            dp["買い残高"] = Ld["買い残高"].apply(fmt)
+            dp["買い残高(信用%)"] = Ld["買い残高"].apply(
+                lambda v: f"{float(v)/latest_margin_buy*100:.1f}%"
+                if pd.notna(v) and latest_margin_buy and latest_margin_buy > 0 else "-")
+            dp["買い増減"]   = Ld["買い増減"].apply(fmt)
+            dp["買い新規"]   = Ld["買い新規"].apply(fmt)
+            dp["買い返済"]   = Ld["買い返済"].apply(fmt)
+            dp["売り残高"] = Ld["売り残高"].apply(fmt)
+            dp["売り残高(信用%)"] = Ld["売り残高"].apply(
+                lambda v: f"{float(v)/latest_margin_sel*100:.1f}%"
+                if pd.notna(v) and latest_margin_sel and latest_margin_sel > 0 else "-")
+            dp["売り増減"]   = Ld["売り増減"].apply(fmt)
+            dp["売り新規"]   = Ld["売り新規"].apply(fmt)
+            dp["売り返済"]   = Ld["売り返済"].apply(fmt)
             dp["貸借倍率"] = Ld["貸借倍率"].apply(
                 lambda v: "-" if pd.isna(v) else "∞" if abs(v)==float("inf") else f"{v:.2f}倍")
             dp["逆日歩"] = Ld["逆日歩"].apply(
                 lambda v: f"{v:.2f}" if pd.notna(v) and v > 0 else "-")
 
+            # 平均行
             av = {c: "" for c in LCOLS}; av["申込日"] = "【平均】"
             for c in LNUM: av[c] = fmt(Ld[c].mean(skipna=True))
             av["貸借倍率"] = fmt(Ld["貸借倍率"].replace([float("inf"),float("-inf")],
                                float("nan")).mean(skipna=True), dec=2, suffix="倍")
             av["逆日歩"] = fmt(Ld["逆日歩"].mean(skipna=True), dec=2)
+            # 信用%の平均
+            if latest_margin_buy and latest_margin_buy > 0:
+                av["買い残高(信用%)"] = f"{Ld['買い残高'].mean(skipna=True)/latest_margin_buy*100:.1f}%"
+            if latest_margin_sel and latest_margin_sel > 0:
+                av["売り残高(信用%)"] = f"{Ld['売り残高'].mean(skipna=True)/latest_margin_sel*100:.1f}%"
+
             disp_l = pd.concat([dp[LCOLS], pd.DataFrame([av])], ignore_index=True)
             st_l   = cell_style(disp_l, Ld, "申込日", LNUM, neg_red=["差引残高"])
 
@@ -212,6 +277,10 @@ for tab, (code, info) in zip(tabs, data.items()):
                 orig = Ld.loc[Ld["申込日"] == dv, "逆日歩"]
                 if not orig.empty and pd.notna(orig.values[0]) and orig.values[0] > 0:
                     st_l.loc[idx, "逆日歩"] = "background-color:#2d1f00;color:#e3b341;font-weight:700"
+                # 信用%セルを薄いグレーで区別
+                for c in ["買い残高(信用%)", "売り残高(信用%)"]:
+                    if st_l.loc[idx, c] == "":
+                        st_l.loc[idx, c] = "color:#8b949e;font-size:11px"
 
             st.dataframe(disp_l.style.apply(lambda _: st_l, axis=None),
                 use_container_width=True, hide_index=True,
@@ -222,7 +291,10 @@ for tab, (code, info) in zip(tabs, data.items()):
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         st.markdown("<h3 style='color:#f0f6fc;font-size:14px;margin:14px 0 4px'>"
                     "② 週次信用残（直近順）</h3>", unsafe_allow_html=True)
-        st.caption("🔴赤=信用倍率1倍未満 ／ 🟡橙=平均3倍超 ／ 🟠逆日歩発生 ／ 青=プラス・赤=マイナス")
+        st.caption(
+            "🔴赤=信用倍率1倍未満 ／ 🟡橙=平均3倍超 ／ 🟠逆日歩発生 ／ 青=プラス・赤=マイナス\n"
+            "買い残高(出来高%) ・売り残高(出来高%)：対応週の出来高合計に占める信用残高の割合（週次出来高≈月次平均×5日）"
+        )
 
         if M.empty:
             st.warning("信用残データを取得できませんでした。")
@@ -239,15 +311,28 @@ for tab, (code, info) in zip(tabs, data.items()):
                 hovertemplate="%{x}<br>売り残高:%{y:,.0f}<extra></extra>"))
             fig_base(fig2, 260); st.plotly_chart(fig2, use_container_width=True)
 
-            MCOLS = ["日付","買い残高","買い増減","売り残高","売り増減",
+            # 週次出来高の推定（月次平均出来高 × 5日）
+            daily_vol_avg = P["出来高"].mean() if not P.empty else None
+            weekly_vol_est = daily_vol_avg * 5 if daily_vol_avg else None
+
+            MCOLS = ["日付","買い残高","買い残高(出来高%)","買い増減",
+                     "売り残高","売り残高(出来高%)","売り増減",
                      "信用倍率","買い残増減率","売り残増減率","逆日歩"]
             MNUM  = ["買い残高","買い増減","売り残高","売り増減","信用倍率",
                      "買い残増減率","売り残増減率"]
             Md = M.sort_values("_dt", ascending=False).reset_index(drop=True)
             dm = pd.DataFrame(); dm["日付"] = Md["日付"]
             dm["買い残高"]    = Md["買い残高"].apply(fmt)
+
+            # 買い残高(出来高%)
+            def vol_pct(val, wvol):
+                if pd.isna(val) or not wvol or wvol == 0: return "-"
+                return f"{float(val)/wvol*100:.1f}%"
+
+            dm["買い残高(出来高%)"] = Md["買い残高"].apply(lambda v: vol_pct(v, weekly_vol_est))
             dm["買い増減"]    = Md["買い増減"].apply(fmt)
             dm["売り残高"]    = Md["売り残高"].apply(fmt)
+            dm["売り残高(出来高%)"] = Md["売り残高"].apply(lambda v: vol_pct(v, weekly_vol_est))
             dm["売り増減"]    = Md["売り増減"].apply(fmt)
             dm["信用倍率"]    = Md["信用倍率"].apply(lambda v: f"{v:.2f}倍" if pd.notna(v) else "-")
             dm["買い残増減率"] = Md["買い残増減率"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
@@ -260,6 +345,9 @@ for tab, (code, info) in zip(tabs, data.items()):
             for c in ["買い残増減率","売り残増減率"]:
                 v2 = Md[c].mean(skipna=True)
                 av_m[c] = f"{v2:+.2f}%" if pd.notna(v2) else "-"
+            if weekly_vol_est:
+                av_m["買い残高(出来高%)"] = vol_pct(Md["買い残高"].mean(skipna=True), weekly_vol_est)
+                av_m["売り残高(出来高%)"] = vol_pct(Md["売り残高"].mean(skipna=True), weekly_vol_est)
 
             disp_m = pd.concat([dm[MCOLS], pd.DataFrame([av_m])], ignore_index=True)
             st_m   = cell_style(disp_m, Md, "日付", MNUM, thr=3.0)
@@ -277,17 +365,38 @@ for tab, (code, info) in zip(tabs, data.items()):
                     orig3 = Md.loc[Md["日付"] == dv, c]
                     if not orig3.empty and pd.notna(orig3.values[0]):
                         st_m.loc[idx, c] = f"color:{vc(orig3.values[0])}"
+                # 出来高%セルを薄いグレーで区別
+                for c in ["買い残高(出来高%)", "売り残高(出来高%)"]:
+                    if st_m.loc[idx, c] == "":
+                        st_m.loc[idx, c] = "color:#8b949e;font-size:11px"
 
             st.dataframe(disp_m.style.apply(lambda _: st_m, axis=None),
                 use_container_width=True, hide_index=True,
                 height=min(38*(len(disp_m)+1)+38, 520))
 
+            if weekly_vol_est:
+                st.caption(f"※出来高%の算出基準：月次平均日次出来高 {daily_vol_avg/1e6:.1f}M × 5日 "
+                           f"= 週次推計出来高 {weekly_vol_est/1e6:.0f}M（株探などの週次出来高と差異が生じる場合があります）")
+
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # ③ 株価急変 ＋ 出来高（IRバンク chart）
+        # ③ 株価急変 ＋ 出来高
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         st.markdown("<h3 style='color:#f0f6fc;font-size:14px;margin:14px 0 4px'>"
                     "③ 株価急変 ＋ 出来高（直近順）</h3>", unsafe_allow_html=True)
         st.caption("🔴★=大口機関の可能性 ／ 🟡=出来高月平均×2超 ／ 青=プラス・赤=マイナス ／ 25日乖離・PER・PBR付き")
+
+        # 大口機関の定義ノート
+        with st.expander("🔍 大口機関の可能性（🔴★）の判定定義", expanded=False):
+            st.markdown("""
+| 条件 | 内容 |
+|---|---|
+| ① 大量売買＋価格インパクト | 出来高が月平均の **2倍超** かつ 前日比 **±1.5%以上** |
+| ② 急騰・急落＋出来高急増 | 前日比 **±4%以上** かつ 出来高が月平均の **1.5倍超** |
+| ③ 日中値幅急拡大 | 当日の高値−安値が過去5日平均値幅の **2倍超** |
+
+①〜③のいずれかを満たした場合に 🔴機関 と判定します。
+> 大口の方向性売買・ポジション構築・強制執行（追証売り）などが発生した可能性を示す参考指標です。確定的な判断には別途ファンダメンタルズ分析・ニュース確認が必要です。
+            """)
 
         if P.empty:
             st.warning("株価データを取得できませんでした。")
@@ -295,7 +404,6 @@ for tab, (code, info) in zip(tabs, data.items()):
             vm  = P["出来高平均"].iloc[0]
             Pa  = P.sort_values("_dt", ascending=True)
 
-            # 株価＋出来高グラフ
             fig3 = make_subplots(rows=2, cols=1, shared_xaxes=True,
                 row_heights=[0.65, 0.35], vertical_spacing=0.04)
 
@@ -329,9 +437,12 @@ for tab, (code, info) in zip(tabs, data.items()):
                 annotation_text="×2", annotation_font_color="#e3b341", row=2, col=1)
             fig_base(fig3, 420); st.plotly_chart(fig3, use_container_width=True)
 
-            # 株価テーブル（直近が上・25日乖離・PER・PBR付き）
-            raw_p = {c: P[c].copy() for c in ["終値","出来高","前日比%","25日乖離率","PER","PBR"]}
+            # 株価テーブル（高値・安値追加・直近が上）
+            raw_p = {c: P[c].copy() for c in ["始値","高値","安値","終値","出来高","前日比%","25日乖離率","PER","PBR"]}
             pt = pd.DataFrame(); pt["日付"] = P["日付"]
+            pt["始値"]      = raw_p["始値"].apply(lambda v: f"¥{v:,.1f}" if pd.notna(v) else "-")
+            pt["高値"]      = raw_p["高値"].apply(lambda v: f"¥{v:,.1f}" if pd.notna(v) else "-")
+            pt["安値"]      = raw_p["安値"].apply(lambda v: f"¥{v:,.1f}" if pd.notna(v) else "-")
             pt["終値"]      = raw_p["終値"].apply(lambda v: f"¥{v:,.1f}" if pd.notna(v) else "-")
             pt["前日比%"]   = raw_p["前日比%"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
             pt["25日乖離率"] = raw_p["25日乖離率"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
@@ -341,8 +452,12 @@ for tab, (code, info) in zip(tabs, data.items()):
             pt["出来高"]     = raw_p["出来高"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "-")
             pt["出来高判定"]  = P["出来高異常"].map({True:"🟠 急増", False:"✅ 通常"})
 
-            sc = ["日付","終値","前日比%","25日乖離率","PER","PBR","株価判定","出来高","出来高判定"]
+            sc = ["日付","始値","高値","安値","終値","前日比%","25日乖離率","PER","PBR",
+                  "株価判定","出来高","出来高判定"]
             ar = {"日付":"【平均】",
+                  "始値": f"¥{raw_p['始値'].mean():,.1f}",
+                  "高値": f"¥{raw_p['高値'].mean():,.1f}",
+                  "安値": f"¥{raw_p['安値'].mean():,.1f}",
                   "終値": f"¥{raw_p['終値'].mean():,.1f}",
                   "前日比%": f"{raw_p['前日比%'].mean(skipna=True):+.2f}%",
                   "25日乖離率": f"{raw_p['25日乖離率'].mean(skipna=True):+.2f}%",
@@ -388,19 +503,18 @@ for i, (code, info) in enumerate(data.items()):
         pct = f"{chg:+.2f}%"; pc = POS if chg >= 0 else NEG
 
     inst = f"{P['機関異常'].sum()}日/{len(P)}日" if not P.empty else "-"
-
     per_v = pbr_v = ma25_v = "-"
     if not P.empty:
         per_v  = fmt(P["PER"].dropna().iloc[0]  if not P["PER"].dropna().empty  else float("nan"), dec=2, suffix="倍")
         pbr_v  = fmt(P["PBR"].dropna().iloc[0]  if not P["PBR"].dropna().empty  else float("nan"), dec=2, suffix="倍")
-        ma25_v = fmt(P["25日乖離率"].iloc[0]     if not P.empty else float("nan"), dec=2, suffix="%")
+        ma25_v = fmt(P["25日乖離率"].iloc[0] if not P.empty else float("nan"), dec=2, suffix="%")
 
     lr = buy_a = sel_a = smr = "-"
     if not L.empty:
         r = L["貸借倍率"].iloc[-1]
         lr = "-" if pd.isna(r) else "∞" if abs(r)==float("inf") else f"{r:.2f}倍"
         buy_a = fmt(L["買い残高"].mean(skipna=True))
-        sel_a = fmt(L["売い残高"].mean(skipna=True)) if "売い残高" in L.columns else fmt(L["売り残高"].mean(skipna=True))
+        sel_a = fmt(L["売り残高"].mean(skipna=True))
     if not M.empty and "信用倍率" in M.columns:
         lm = M["信用倍率"].dropna()
         if not lm.empty: v=lm.iloc[-1]; smr=f"{v:.2f}倍"+(" 🔴" if v<1 else "")
