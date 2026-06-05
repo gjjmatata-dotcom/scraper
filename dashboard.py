@@ -311,72 +311,118 @@ for tab, (code, info) in zip(tabs, data.items()):
                 hovertemplate="%{x}<br>売り残高:%{y:,.0f}<extra></extra>"))
             fig_base(fig2, 260); st.plotly_chart(fig2, use_container_width=True)
 
-            # 週次出来高の推定（月次平均出来高 × 5日）
+            # 日次平均出来高（株価テーブルから取得）
             daily_vol_avg = P["出来高"].mean() if not P.empty else None
-            weekly_vol_est = daily_vol_avg * 5 if daily_vol_avg else None
 
-            MCOLS = ["日付","買い残高","買い残高(出来高%)","買い増減",
-                     "売り残高","売り残高(出来高%)","売り増減",
+            def days_fmt(val, dvol):
+                """消化日数 = 残高 ÷ 日次平均出来高"""
+                if pd.isna(val) or not dvol or dvol == 0: return None, "-"
+                days = float(val) / dvol
+                return days, f"{days:.1f}日"
+
+            MCOLS = ["日付","買い残高","買い残消化日数","買い増減",
+                     "売り残高","売り残消化日数","売り増減","信用需給ネット",
                      "信用倍率","買い残増減率","売り残増減率","逆日歩"]
             MNUM  = ["買い残高","買い増減","売り残高","売り増減","信用倍率",
                      "買い残増減率","売り残増減率"]
             Md = M.sort_values("_dt", ascending=False).reset_index(drop=True)
+
+            # 消化日数・信用需給ネットを計算してMdに追加（スタイル判定用）
+            Md["買い残消化日数_num"] = Md["買い残高"].apply(
+                lambda v: float(v)/daily_vol_avg if pd.notna(v) and daily_vol_avg else float("nan"))
+            Md["売り残消化日数_num"] = Md["売り残高"].apply(
+                lambda v: float(v)/daily_vol_avg if pd.notna(v) and daily_vol_avg else float("nan"))
+            Md["信用需給ネット_num"] = Md["買い残消化日数_num"] - Md["売り残消化日数_num"]
+
             dm = pd.DataFrame(); dm["日付"] = Md["日付"]
-            dm["買い残高"]    = Md["買い残高"].apply(fmt)
+            dm["買い残高"]      = Md["買い残高"].apply(fmt)
+            dm["買い残消化日数"] = Md["買い残消化日数_num"].apply(
+                lambda v: f"{v:.1f}日" if pd.notna(v) else "-")
+            dm["買い増減"]      = Md["買い増減"].apply(fmt)
+            dm["売り残高"]      = Md["売り残高"].apply(fmt)
+            dm["売り残消化日数"] = Md["売り残消化日数_num"].apply(
+                lambda v: f"{v:.1f}日" if pd.notna(v) else "-")
+            dm["売り増減"]      = Md["売り増減"].apply(fmt)
+            dm["信用需給ネット"] = Md["信用需給ネット_num"].apply(
+                lambda v: f"{v:+.1f}日" if pd.notna(v) else "-")
+            dm["信用倍率"]      = Md["信用倍率"].apply(lambda v: f"{v:.2f}倍" if pd.notna(v) else "-")
+            dm["買い残増減率"]   = Md["買い残増減率"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
+            dm["売り残増減率"]   = Md["売り残増減率"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
+            dm["逆日歩"]        = Md["逆日歩"].apply(lambda v: f"{v:.2f}" if pd.notna(v) and v > 0 else "-")
 
-            # 買い残高(出来高%)
-            def vol_pct(val, wvol):
-                if pd.isna(val) or not wvol or wvol == 0: return "-"
-                return f"{float(val)/wvol*100:.1f}%"
-
-            dm["買い残高(出来高%)"] = Md["買い残高"].apply(lambda v: vol_pct(v, weekly_vol_est))
-            dm["買い増減"]    = Md["買い増減"].apply(fmt)
-            dm["売り残高"]    = Md["売り残高"].apply(fmt)
-            dm["売り残高(出来高%)"] = Md["売り残高"].apply(lambda v: vol_pct(v, weekly_vol_est))
-            dm["売り増減"]    = Md["売り増減"].apply(fmt)
-            dm["信用倍率"]    = Md["信用倍率"].apply(lambda v: f"{v:.2f}倍" if pd.notna(v) else "-")
-            dm["買い残増減率"] = Md["買い残増減率"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
-            dm["売り残増減率"] = Md["売り残増減率"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
-            dm["逆日歩"]      = Md["逆日歩"].apply(lambda v: f"{v:.2f}" if pd.notna(v) and v > 0 else "-")
-
+            # 平均行
             av_m = {c: "" for c in MCOLS}; av_m["日付"] = "【平均】"
             for c in ["買い残高","売り残高"]: av_m[c] = fmt(Md[c].mean(skipna=True))
             av_m["信用倍率"] = fmt(Md["信用倍率"].mean(skipna=True), dec=2, suffix="倍")
             for c in ["買い残増減率","売り残増減率"]:
                 v2 = Md[c].mean(skipna=True)
                 av_m[c] = f"{v2:+.2f}%" if pd.notna(v2) else "-"
-            if weekly_vol_est:
-                av_m["買い残高(出来高%)"] = vol_pct(Md["買い残高"].mean(skipna=True), weekly_vol_est)
-                av_m["売り残高(出来高%)"] = vol_pct(Md["売り残高"].mean(skipna=True), weekly_vol_est)
+            if daily_vol_avg:
+                avg_buy_days = Md["買い残消化日数_num"].mean(skipna=True)
+                avg_sel_days = Md["売り残消化日数_num"].mean(skipna=True)
+                av_m["買い残消化日数"] = f"{avg_buy_days:.1f}日" if pd.notna(avg_buy_days) else "-"
+                av_m["売り残消化日数"] = f"{avg_sel_days:.1f}日" if pd.notna(avg_sel_days) else "-"
+                avg_net = Md["信用需給ネット_num"].mean(skipna=True)
+                av_m["信用需給ネット"] = f"{avg_net:+.1f}日" if pd.notna(avg_net) else "-"
 
             disp_m = pd.concat([dm[MCOLS], pd.DataFrame([av_m])], ignore_index=True)
             st_m   = cell_style(disp_m, Md, "日付", MNUM, thr=3.0)
 
             for idx in disp_m[disp_m["日付"] != "【平均】"].index:
                 dv = disp_m.loc[idx, "日付"]
+
+                # 信用倍率 < 1 → 赤
                 orig = Md.loc[Md["日付"] == dv, "信用倍率"]
                 if not orig.empty and pd.notna(orig.values[0]) and orig.values[0] < 1:
                     st_m.loc[idx, "信用倍率"] = "background-color:#3d1a1a;color:#f85149;font-weight:700"
+
+                # 逆日歩 > 0 → 橙
                 orig2 = Md.loc[Md["日付"] == dv, "逆日歩"]
                 if not orig2.empty and pd.notna(orig2.values[0]) and orig2.values[0] > 0:
                     st_m.loc[idx, "逆日歩"] = "background-color:#2d1f00;color:#e3b341;font-weight:700"
+
+                # 増減率 正負カラー
                 for c in ["買い残増減率","売り残増減率"]:
                     if st_m.loc[idx, c] != "": continue
                     orig3 = Md.loc[Md["日付"] == dv, c]
                     if not orig3.empty and pd.notna(orig3.values[0]):
                         st_m.loc[idx, c] = f"color:{vc(orig3.values[0])}"
-                # 出来高%セルを薄いグレーで区別
-                for c in ["買い残高(出来高%)", "売り残高(出来高%)"]:
-                    if st_m.loc[idx, c] == "":
-                        st_m.loc[idx, c] = "color:#8b949e;font-size:11px"
+
+                # 買い残消化日数：100日超→黄、20日超→赤
+                bd = Md.loc[Md["日付"] == dv, "買い残消化日数_num"]
+                if not bd.empty and pd.notna(bd.values[0]):
+                    bv = bd.values[0]
+                    if bv > 100:
+                        st_m.loc[idx, "買い残消化日数"] = "background-color:#2d1f00;color:#e3b341;font-weight:700"
+                    elif bv > 20:
+                        st_m.loc[idx, "買い残消化日数"] = "background-color:#3d1a1a;color:#f85149;font-weight:700"
+
+                # 売り残消化日数：同基準
+                sd = Md.loc[Md["日付"] == dv, "売り残消化日数_num"]
+                if not sd.empty and pd.notna(sd.values[0]):
+                    sv = sd.values[0]
+                    if sv > 100:
+                        st_m.loc[idx, "売り残消化日数"] = "background-color:#2d1f00;color:#e3b341;font-weight:700"
+                    elif sv > 20:
+                        st_m.loc[idx, "売り残消化日数"] = "background-color:#3d1a1a;color:#f85149;font-weight:700"
+
+                # 信用需給ネット：正=売り圧力(赤)、負=踏み上げ余地(青)
+                nd = Md.loc[Md["日付"] == dv, "信用需給ネット_num"]
+                if not nd.empty and pd.notna(nd.values[0]):
+                    nv = nd.values[0]
+                    if st_m.loc[idx, "信用需給ネット"] == "":
+                        st_m.loc[idx, "信用需給ネット"] = f"color:{NEG if nv > 0 else POS};font-weight:600"
 
             st.dataframe(disp_m.style.apply(lambda _: st_m, axis=None),
                 use_container_width=True, hide_index=True,
                 height=min(38*(len(disp_m)+1)+38, 520))
 
-            if weekly_vol_est:
-                st.caption(f"※出来高%の算出基準：月次平均日次出来高 {daily_vol_avg/1e6:.1f}M × 5日 "
-                           f"= 週次推計出来高 {weekly_vol_est/1e6:.0f}M（株探などの週次出来高と差異が生じる場合があります）")
+            if daily_vol_avg:
+                st.caption(
+                    f"※消化日数 = 残高 ÷ 日次平均出来高（{daily_vol_avg/1e6:.1f}M株/日）　"
+                    "🔴赤=20日超（需給重い）／ 🟡橙=100日超（極めて重い）　"
+                    "信用需給ネット：プラス=売り圧力優勢 / マイナス=踏み上げ余地あり"
+                )
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # ③ 株価急変 ＋ 出来高
