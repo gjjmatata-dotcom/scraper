@@ -17,12 +17,39 @@ HEADERS = {
     "Referer": "https://irbank.net/",
 }
 
+# デフォルトウォッチリスト（起動時に表示）
 STOCKS = {
     "9432": {"name": "NTT",         "yf": "9432.T"},
     "9434": {"name": "ソフトバンク", "yf": "9434.T"},
     "6758": {"name": "ソニーG",      "yf": "6758.T"},
     "9984": {"name": "SBG",          "yf": "9984.T"},
 }
+
+def resolve_name(code: str) -> str:
+    """
+    IRバンクの銘柄ページから社名を取得する。
+    取得失敗時は空文字を返す。
+    """
+    html = _fetch(f"https://irbank.net/{code}")
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "lxml")
+    # <title> タグは "7203 トヨタ自動車 | IRバンク" のような形式
+    title = soup.find("title")
+    if title:
+        parts = title.get_text(strip=True).split()
+        # 先頭が銘柄コード、次が社名
+        if len(parts) >= 2 and parts[0] == code:
+            return parts[1]
+        # コードを除いた部分を社名とする
+        text = title.get_text(strip=True).replace(code, "").replace("|", "").replace("IRバンク","").strip()
+        if text:
+            return text
+    # h1 タグからも試みる
+    h1 = soup.find("h1")
+    if h1:
+        return h1.get_text(strip=True).replace(code, "").strip()
+    return ""
 
 # ── ユーティリティ ────────────────────────────────────
 def _safe_int_fmt(v) -> str:
@@ -238,13 +265,12 @@ def judge_pressure(lending: pd.DataFrame, price: pd.DataFrame) -> dict:
 # ════════════════════════════════════════
 # 全銘柄まとめて取得
 # ════════════════════════════════════════
-def fetch_all() -> dict:
-    result = {}
-    for code, info in STOCKS.items():
-        print(f"\n{'='*40}\n{code} {info['name']}")
-        l = fetch_lending(code); time.sleep(2)
-        p = fetch_price(code);   time.sleep(2)
-        m = fetch_margin(code);  time.sleep(2)
-        result[code] = {"name":info["name"],"lending":l,"price":p,
-                        "margin":m,"pressure":judge_pressure(l,p)}
-    return result
+def fetch_one(code: str) -> dict:
+    """単一銘柄のデータを取得して返す。"""
+    name = STOCKS.get(code, {}).get("name") or resolve_name(code) or code
+    print(f"\n{'='*40}\n{code} {name}")
+    l = fetch_lending(code); time.sleep(2)
+    p = fetch_price(code);   time.sleep(2)
+    m = fetch_margin(code);  time.sleep(2)
+    return {"name": name, "lending": l, "price": p,
+            "margin": m, "pressure": judge_pressure(l, p)}
