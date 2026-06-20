@@ -5,7 +5,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from scraper import fetch_one, STOCKS, _safe_int_fmt
+from scraper import fetch_one, fetch_price_by_url, STOCKS, _safe_int_fmt
 import socket, re
 
 st.set_page_config(page_title="株式貸借分析", page_icon="📊", layout="wide")
@@ -25,9 +25,9 @@ html,body,[class*="css"]{color:#c9d1d9!important;-webkit-text-size-adjust:100%}
   border-bottom:1px solid #21262d!important;white-space:nowrap}
 [data-testid="stButton"] button{background:linear-gradient(135deg,#1f6feb,#388bfd)!important;
   color:#fff!important;border:none!important;border-radius:8px!important;
-  font-weight:600;min-height:44px;font-size:15px!important}
+  font-weight:600;min-height:44px;font-size:14px!important}
 [data-testid="stTextInput"] input{background:#161b22!important;color:#f0f6fc!important;
-  border:1px solid #30363d!important;border-radius:8px!important;font-size:16px!important}
+  border:1px solid #30363d!important;border-radius:8px!important}
 hr{border-color:#30363d!important}
 </style>""", unsafe_allow_html=True)
 
@@ -38,266 +38,228 @@ PR_COLORS = {"🔴 売り圧力優勢":"#f85149","🟢 買い圧力優勢":"#3fb
 POS, NEG = "#58a6ff", "#f85149"
 
 def vc(v):
-    try: return POS if float(v) >= 0 else NEG
+    try: return POS if float(v)>=0 else NEG
     except: return "#c9d1d9"
 
 def fmt(v, dec=0, suffix=""):
     try:
-        f = float(v)
-        if f != f or abs(f) == float("inf"): return "-"
-        s = f"{int(round(f)):,}" if dec == 0 else f"{f:,.{dec}f}"
-        return s + suffix
+        f=float(v)
+        if f!=f or abs(f)==float("inf"): return "-"
+        s=f"{int(round(f)):,}" if dec==0 else f"{f:,.{dec}f}"
+        return s+suffix
     except: return "-"
 
+# ── セッション初期化 ──────────────────────────────────
+for k,v in [("watch_list",{}),("stock_data",{}),("search_history",{})]:
+    if k not in st.session_state: st.session_state[k]=v
+
 # ── サイドバー ────────────────────────────────────────
-try: ip = socket.gethostbyname(socket.gethostname())
-except: ip = "取得失敗"
+try: ip=socket.gethostbyname(socket.gethostname())
+except: ip="取得失敗"
 st.sidebar.markdown("### 📱 LAN内アクセス")
 st.sidebar.code(f"http://{ip}:8501")
 st.sidebar.caption("`--server.address 0.0.0.0` で起動")
 st.sidebar.markdown("[🌐 Streamlit Cloud](https://share.streamlit.io/)")
 
-# ── セッション状態の初期化 ────────────────────────────
-# watch_list: {code: info_dict} の順序付き辞書
-if "watch_list" not in st.session_state:
-    st.session_state.watch_list = dict(STOCKS)   # デフォルト4銘柄
-if "stock_data" not in st.session_state:
-    st.session_state.stock_data = {}             # コード→データのキャッシュ
-
-# ── タイトル ──────────────────────────────────────────
 st.markdown("<h2 style='text-align:center;color:#f0f6fc;font-size:20px;margin:4px 0'>"
             "📊 株式貸借・株価分析ダッシュボード</h2>", unsafe_allow_html=True)
-st.markdown("<p style='text-align:center;color:#8b949e;font-size:11px;margin:0 0 12px'>"
-            "全データ出典：IRバンク(irbank.net) ／ nisshokin・margin・chart</p>",
+st.markdown("<p style='text-align:center;color:#8b949e;font-size:11px;margin:0 0 10px'>"
+            "出典：IRバンク / 日証金 / Yahoo Finance Japan / kabutan.jp</p>",
             unsafe_allow_html=True)
 
 # ── 検索フォーム ──────────────────────────────────────
-st.markdown("<h3 style='color:#f0f6fc;font-size:14px;margin:0 0 8px'>🔍 銘柄検索・追加</h3>",
-            unsafe_allow_html=True)
-
+st.markdown("#### 🔍 銘柄検索", unsafe_allow_html=True)
 with st.form("search_form", clear_on_submit=True):
-    sc1, sc2, sc3 = st.columns([2, 1, 1])
-    with sc1:
-        input_code = st.text_input(
-            "銘柄コード（4桁）",
-            placeholder="例：7203（トヨタ）",
-            label_visibility="collapsed"
-        )
-    with sc2:
-        add_btn = st.form_submit_button("➕ 追加して取得", use_container_width=True)
-    with sc3:
-        search_only = st.form_submit_button("🔄 この銘柄のみ表示", use_container_width=True)
+    c1,c2,c3=st.columns([3,1,1])
+    with c1: inp=st.text_input("銘柄コード",placeholder="例：7203 / 998405 / 9I31115A / NDX",label_visibility="collapsed")
+    with c2: add_btn=st.form_submit_button("➕ 追加",use_container_width=True)
+    with c3: only_btn=st.form_submit_button("🔄 単独表示",use_container_width=True)
 
-# 入力値の検証と処理
-if (add_btn or search_only) and input_code:
-    code_clean = input_code.strip().zfill(4)
-    if not re.fullmatch(r"\d{4}", code_clean):
-        st.error("❌ 4桁の数字を入力してください（例：7203）")
+def _normalize(code):
+    c=code.strip().upper().replace(" ","")
+    return c.zfill(4) if re.fullmatch(r"\d{1,4}",c) else c
+
+def _do_fetch(code):
+    info=fetch_one(code)
+    name=info["name"] or code
+    st.session_state.stock_data[code]=info
+    # 検索履歴（最大10件・最新先頭）
+    h=st.session_state.search_history
+    h.pop(code,None)
+    st.session_state.search_history=dict(list({code:name,**h}.items())[:10])
+    return info,name
+
+if (add_btn or only_btn) and inp:
+    code=_normalize(inp)
+    with st.spinner(f"{code} 取得中…"):
+        info,name=_do_fetch(code)
+    if info["lending"].empty and info["price"].empty:
+        st.error(f"❌ {code} のデータを取得できませんでした。")
     else:
-        with st.spinner(f"{code_clean} のデータを取得中…（約15秒）"):
-            info = fetch_one(code_clean)
+        if only_btn: st.session_state.watch_list={code:{"name":name}}
+        else: st.session_state.watch_list[code]={"name":name}
+        st.success(f"✅ {code} {name}")
 
-        if info["lending"].empty and info["price"].empty:
-            st.error(f"❌ {code_clean} のデータを取得できませんでした。銘柄コードを確認してください。")
-        else:
-            name = info["name"] or code_clean
-            st.session_state.stock_data[code_clean] = info
-
-            if search_only:
-                # この銘柄のみ表示モード
-                st.session_state.watch_list = {code_clean: {"name": name}}
-                st.success(f"✅ {code_clean} {name} を表示中")
-            else:
-                # ウォッチリストに追加
-                st.session_state.watch_list[code_clean] = {"name": name}
-                st.success(f"✅ {code_clean} {name} をウォッチリストに追加しました")
-
-# ── ウォッチリスト管理 ────────────────────────────────
-wl = st.session_state.watch_list
-if wl:
-    st.markdown("<p style='color:#8b949e;font-size:12px;margin:8px 0 4px'>📋 現在のウォッチリスト</p>",
-                unsafe_allow_html=True)
-    tag_cols = st.columns(min(len(wl), 8))
-    for i, (c, inf) in enumerate(list(wl.items())):
-        with tag_cols[i % len(tag_cols)]:
-            col_c = COLORS[i % len(COLORS)]
-            remove = st.button(
-                f"✕ {c} {inf.get('name','')}", key=f"rm_{c}",
-                help=f"{c} をウォッチリストから削除"
-            )
-            if remove:
-                st.session_state.watch_list.pop(c, None)
-                st.session_state.stock_data.pop(c, None)
+# 検索履歴ボタン
+hist=st.session_state.search_history
+if hist:
+    st.caption("🕐 検索履歴（クリックで追加）")
+    hcols=st.columns(min(len(hist),5))
+    for j,(hc,hn) in enumerate(hist.items()):
+        with hcols[j%5]:
+            if st.button(f"＋{hc} {hn}",key=f"h_{hc}"):
+                if hc not in st.session_state.stock_data:
+                    with st.spinner(f"{hc}取得中…"):
+                        _do_fetch(hc)
+                st.session_state.watch_list[hc]={"name":hn}
                 st.rerun()
 
-# 全更新ボタン
-rc1, rc2 = st.columns([1, 4])
-with rc1:
-    if st.button("🔄 全銘柄を最新化", type="primary"):
-        st.session_state.stock_data = {}
+# デフォルト4銘柄ボタン
+st.caption("📋 デフォルト銘柄")
+dcols=st.columns(len(STOCKS)+1)
+for i,(dc,di) in enumerate(STOCKS.items()):
+    with dcols[i]:
+        if st.button(f"＋{dc} {di['name']}",key=f"def_{dc}"):
+            if dc not in st.session_state.stock_data:
+                with st.spinner(f"{dc}取得中…"):
+                    _do_fetch(dc)
+            st.session_state.watch_list[dc]={"name":di["name"]}
+            st.rerun()
+with dcols[len(STOCKS)]:
+    if st.button("🔄 全更新"):
+        st.session_state.stock_data={}
         st.rerun()
-with rc2:
-    st.caption("10分キャッシュ ｜ 全銘柄最新化は約15秒×銘柄数かかります")
+
+# ウォッチリスト管理
+wl=st.session_state.watch_list
+if wl:
+    st.caption("📌 ウォッチリスト（✕で削除）")
+    wcols=st.columns(min(len(wl),6))
+    for i,(wc,wi) in enumerate(list(wl.items())):
+        with wcols[i%6]:
+            if st.button(f"✕ {wc} {wi.get('name','')}",key=f"rm_{wc}"):
+                wl.pop(wc,None); st.session_state.stock_data.pop(wc,None); st.rerun()
 
 st.divider()
 
-# ── データ取得（未取得の銘柄のみ） ───────────────────
-@st.cache_data(ttl=600, show_spinner=False)
-def cached_fetch(code: str) -> dict:
-    return fetch_one(code)
-
-for code in list(st.session_state.watch_list.keys()):
-    if code not in st.session_state.stock_data:
-        with st.spinner(f"{code} {st.session_state.watch_list[code].get('name','')} を取得中…"):
-            result = cached_fetch(code)
-            st.session_state.stock_data[code] = result
-            # 社名をウォッチリストに反映
-            if result["name"] and result["name"] != code:
-                st.session_state.watch_list[code]["name"] = result["name"]
-
-if not st.session_state.stock_data:
-    st.info("銘柄コードを入力して検索するか、上の「全銘柄を最新化」ボタンを押してください。")
+if not wl:
+    st.info("上の検索フォームまたはデフォルト銘柄ボタンから銘柄を追加してください。")
     st.stop()
+
+# 未取得銘柄を自動取得
+for code in list(wl.keys()):
+    if code not in st.session_state.stock_data:
+        with st.spinner(f"{code} 取得中…"):
+            _do_fetch(code)
+
 
 # ── Plotly共通 ────────────────────────────────────────
 def fig_base(fig, h=380):
-    fig.update_layout(paper_bgcolor="#0d1117", plot_bgcolor="#161b22",
-        font=dict(color="#c9d1d9", size=11),
-        legend=dict(bgcolor="rgba(22,27,34,0.9)", bordercolor="#30363d", borderwidth=1,
-                    orientation="h", yanchor="bottom", y=1.02),
-        margin=dict(l=4, r=4, t=36, b=4), height=h)
-    fig.update_xaxes(gridcolor="#21262d", linecolor="#30363d",
-                     tickfont=dict(color="#8b949e", size=10), tickangle=-30)
-    fig.update_yaxes(gridcolor="#21262d", linecolor="#30363d",
-                     tickfont=dict(color="#8b949e", size=10), tickformat=",")
+    fig.update_layout(paper_bgcolor="#0d1117",plot_bgcolor="#161b22",
+        font=dict(color="#c9d1d9",size=11),
+        legend=dict(bgcolor="rgba(22,27,34,0.9)",bordercolor="#30363d",borderwidth=1,
+                    orientation="h",yanchor="bottom",y=1.02),
+        margin=dict(l=4,r=4,t=36,b=4),height=h)
+    fig.update_xaxes(gridcolor="#21262d",linecolor="#30363d",
+                     tickfont=dict(color="#8b949e",size=10),tickangle=-30)
+    fig.update_yaxes(gridcolor="#21262d",linecolor="#30363d",
+                     tickfont=dict(color="#8b949e",size=10),tickformat=",")
 
 # ── セルスタイル ──────────────────────────────────────
-def cell_style(disp, raw, dcol, num_cols, neg_red=None, thr=3.0):
-    styled = pd.DataFrame("", index=disp.index, columns=disp.columns)
-    avg_m = disp[dcol] == "【平均】"
-    styled.loc[avg_m] = "background-color:#1c2951;font-weight:700;color:#e3b341"
-    neg_red = neg_red or []
+def cell_style(disp,raw,dcol,num_cols,neg_red=None,thr=3.0):
+    styled=pd.DataFrame("",index=disp.index,columns=disp.columns)
+    avg_m=disp[dcol]=="【平均】"
+    styled.loc[avg_m]="background-color:#1c2951;font-weight:700;color:#e3b341"
+    neg_red=neg_red or []
     for col in num_cols:
         if col not in raw.columns: continue
-        s = raw[col].replace([float("inf"), float("-inf")], float("nan")).dropna()
+        s=raw[col].replace([float("inf"),float("-inf")],float("nan")).dropna()
         if s.empty: continue
-        ca = s.abs().mean()
+        ca=s.abs().mean()
         for idx in disp[~avg_m].index:
-            dv = disp.loc[idx, dcol]
-            orig = raw.loc[raw[dcol] == dv, col]
+            dv=disp.loc[idx,dcol]
+            orig=raw.loc[raw[dcol]==dv,col]
             if orig.empty or pd.isna(orig.values[0]): continue
-            v = float(orig.values[0])
-            if col in neg_red and v < 0:
-                styled.loc[idx, col] = "background-color:#3d1a1a;color:#f85149;font-weight:700"
-            elif ca > 0 and abs(v) >= ca * thr:
-                styled.loc[idx, col] = "background-color:#2d1f00;color:#e3b341;font-weight:700"
-            elif styled.loc[idx, col] == "":
-                styled.loc[idx, col] = f"color:{vc(v)}"
+            v=float(orig.values[0])
+            if col in neg_red and v<0:
+                styled.loc[idx,col]="background-color:#3d1a1a;color:#f85149;font-weight:700"
+            elif ca>0 and abs(v)>=ca*thr:
+                styled.loc[idx,col]="background-color:#2d1f00;color:#e3b341;font-weight:700"
+            elif styled.loc[idx,col]=="":
+                styled.loc[idx,col]=f"color:{vc(v)}"
     return styled
 
 def get_latest_margin_bal(M):
-    if M.empty: return None, None
-    ms = M.sort_values("_dt", ascending=False)
-    buy = ms["買い残高"].dropna()
-    sel = ms["売り残高"].dropna()
-    return (buy.iloc[0] if not buy.empty else None,
-            sel.iloc[0] if not sel.empty else None)
+    if M.empty: return None,None
+    ms=M.sort_values("_dt",ascending=False)
+    b=ms["買い残高"].dropna(); s=ms["売り残高"].dropna()
+    return (b.iloc[0] if not b.empty else None),(s.iloc[0] if not s.empty else None)
 
 
 # ════════════════════════════════════════
-# 銘柄タブ描画関数
+# 銘柄描画関数
 # ════════════════════════════════════════
-def render_stock(code: str, info: dict, col_hex: str):
-    L = info["lending"]; P = info["price"]; M = info["margin"]
-    pr = info["pressure"]
-    prc = PR_COLORS.get(pr["label"], "#8b949e")
-    latest_margin_buy, latest_margin_sel = get_latest_margin_bal(M)
+def render_stock(code, info, col_hex):
+    L=info["lending"]; P=info["price"]; M=info["margin"]
+    pr=info["pressure"]; prc=PR_COLORS.get(pr["label"],"#8b949e")
+    lmb,lms=get_latest_margin_bal(M)
 
-    # 圧力バナー
     st.markdown(f"""<div style="background:#161b22;border-left:4px solid {prc};
-        border-radius:6px;padding:10px 14px;margin-bottom:14px">
+        border-radius:6px;padding:10px 14px;margin-bottom:12px">
       <span style="font-size:1.05rem;font-weight:700;color:{prc}">{pr['label']}</span>
       <span style="color:#8b949e;font-size:0.82rem;margin-left:10px">{pr['detail']}</span>
     </div>""", unsafe_allow_html=True)
 
-    # ── ① 貸借取引残高 ──────────────────────────────
-    st.markdown("<h3 style='color:#f0f6fc;font-size:14px;margin:0 0 4px'>"
-                "① 貸借取引残高 + 逆日歩（直近順）</h3>", unsafe_allow_html=True)
-    if latest_margin_buy and latest_margin_sel:
-        st.caption(
-            f"🔴赤=差引マイナス ／ 🟡橙=平均3倍超 ／ 🟠逆日歩発生 ／ 青=プラス・赤=マイナス\n"
-            f"信用%：最新週次信用残（買い:{int(latest_margin_buy):,} / 売り:{int(latest_margin_sel):,}）に占める割合"
-        )
-    else:
-        st.caption("🔴赤=差引マイナス ／ 🟡橙=平均3倍超 ／ 🟠逆日歩発生")
-
-    if L.empty:
-        st.warning("貸借データを取得できませんでした。")
-    else:
-        La = L.sort_values("_dt", ascending=True)
-        fig1 = make_subplots(rows=2, cols=1, shared_xaxes=True,
-            row_heights=[0.65, 0.35], vertical_spacing=0.05,
-            subplot_titles=["買い残高・売り残高 ＋ 株価（右軸）","資金フロー（買い新規－売り新規）"],
-            specs=[[{"secondary_y": True}],[{"secondary_y": False}]])
-        fig1.add_trace(go.Scatter(x=La["申込日"], y=La["買い残高"], name="買い残高",
-            line=dict(color="#388bfd", width=2), fill="tozeroy",
-            fillcolor="rgba(56,139,253,0.08)",
-            hovertemplate="%{x}<br>買い残高:%{y:,.0f}<extra></extra>"),
-            row=1, col=1, secondary_y=False)
-        fig1.add_trace(go.Scatter(x=La["申込日"], y=La["売り残高"], name="売り残高",
-            line=dict(color="#f85149", width=2), fill="tozeroy",
-            fillcolor="rgba(248,81,73,0.08)",
-            hovertemplate="%{x}<br>売り残高:%{y:,.0f}<extra></extra>"),
-            row=1, col=1, secondary_y=False)
+    # ① 貸借取引残高
+    if not L.empty:
+        st.markdown("**① 貸借取引残高 + 逆日歩**")
+        if lmb and lms:
+            st.caption(f"信用%：最新週次信用残（買:{int(lmb):,} / 売:{int(lms):,}）に占める割合 ／ 🔴差引マイナス ／ 🟡平均3倍超")
+        La=L.sort_values("_dt",ascending=True)
+        fig1=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.65,0.35],
+            vertical_spacing=0.05,
+            subplot_titles=["買い残高・売り残高＋株価（右軸）","資金フロー（買い新規－売い新規）"],
+            specs=[[{"secondary_y":True}],[{"secondary_y":False}]])
+        fig1.add_trace(go.Scatter(x=La["申込日"],y=La["買い残高"],name="買い残高",
+            line=dict(color="#388bfd",width=2),fill="tozeroy",fillcolor="rgba(56,139,253,0.08)",
+            hovertemplate="%{x}<br>買い残高:%{y:,.0f}<extra></extra>"),row=1,col=1,secondary_y=False)
+        fig1.add_trace(go.Scatter(x=La["申込日"],y=La["売り残高"],name="売り残高",
+            line=dict(color="#f85149",width=2),fill="tozeroy",fillcolor="rgba(248,81,73,0.08)",
+            hovertemplate="%{x}<br>売り残高:%{y:,.0f}<extra></extra>"),row=1,col=1,secondary_y=False)
         if not P.empty:
-            Pa_asc = P.sort_values("_dt", ascending=True)
-            fig1.add_trace(go.Scatter(x=Pa_asc["日付"], y=Pa_asc["終値"], name="株価",
-                line=dict(color="#e3b341", width=1.5, dash="dot"),
-                hovertemplate="%{x}<br>株価:¥%{y:,.1f}<extra></extra>"),
-                row=1, col=1, secondary_y=True)
-            fig1.update_yaxes(title_text="株価(円)", secondary_y=True,
-                gridcolor="#21262d", tickfont=dict(color="#e3b341", size=9),
-                tickformat=",", row=1, col=1)
-        flow = La["買い新規"].fillna(0) - La["売り新規"].fillna(0)
-        fig1.add_trace(go.Bar(x=La["申込日"], y=flow, name="資金フロー",
-            marker_color=["#388bfd" if v>=0 else "#f85149" for v in flow], opacity=0.85,
-            hovertemplate="%{x}<br>フロー:%{y:,.0f}<extra></extra>"), row=2, col=1)
-        fig1.add_hline(y=0, line_dash="solid", line_color="#484f58", line_width=1, row=2, col=1)
-        fig_base(fig1, 400); st.plotly_chart(fig1, use_container_width=True)
+            Pa=P.sort_values("_dt",ascending=True)
+            fig1.add_trace(go.Scatter(x=Pa["日付"],y=Pa["終値"],name="株価",
+                line=dict(color="#e3b341",width=1.5,dash="dot"),
+                hovertemplate="%{x}<br>¥%{y:,.1f}<extra></extra>"),row=1,col=1,secondary_y=True)
+            fig1.update_yaxes(title_text="株価",secondary_y=True,gridcolor="#21262d",
+                tickfont=dict(color="#e3b341",size=9),tickformat=",",row=1,col=1)
+        flow=La["買い新規"].fillna(0)-La["売り新規"].fillna(0)
+        fig1.add_trace(go.Bar(x=La["申込日"],y=flow,name="資金フロー",
+            marker_color=["#388bfd" if v>=0 else "#f85149" for v in flow],opacity=0.85,
+            hovertemplate="%{x}<br>%{y:,.0f}<extra></extra>"),row=2,col=1)
+        fig1.add_hline(y=0,line_dash="solid",line_color="#484f58",line_width=1,row=2,col=1)
+        fig_base(fig1,400); st.plotly_chart(fig1,use_container_width=True)
 
-        LCOLS = ["申込日","買い残高","買い残高(信用%)","買い増減","買い新規","買い返済",
-                 "売り残高","売り残高(信用%)","売り増減","売り新規","売り返済","貸借倍率","逆日歩"]
-        LNUM  = ["買い残高","買い増減","買い新規","買い返済","売り残高","売り増減","売い新規","売り返済"]
-        LNUM  = ["買い残高","買い増減","買い新規","買い返済","売り残高","売り増減","売り新規","売り返済"]
-        Ld = L.sort_values("_dt", ascending=False).reset_index(drop=True)
-        Ld["差引残高"] = Ld["買い残高"].fillna(0) - Ld["売り残高"].fillna(0)
-        dp = pd.DataFrame(); dp["申込日"] = Ld["申込日"]
-        dp["買い残高"] = Ld["買い残高"].apply(fmt)
-        dp["買い残高(信用%)"] = Ld["買い残高"].apply(
-            lambda v: f"{float(v)/latest_margin_buy*100:.1f}%"
-            if pd.notna(v) and latest_margin_buy and latest_margin_buy > 0 else "-")
-        dp["買い増減"] = Ld["買い増減"].apply(fmt)
-        dp["買い新規"] = Ld["買い新規"].apply(fmt)
-        dp["買い返済"] = Ld["買い返済"].apply(fmt)
-        dp["売り残高"] = Ld["売り残高"].apply(fmt)
-        dp["売り残高(信用%)"] = Ld["売り残高"].apply(
-            lambda v: f"{float(v)/latest_margin_sel*100:.1f}%"
-            if pd.notna(v) and latest_margin_sel and latest_margin_sel > 0 else "-")
-        dp["売り増減"] = Ld["売り増減"].apply(fmt)
-        dp["売り新規"] = Ld["売り新規"].apply(fmt)
-        dp["売り返済"] = Ld["売り返済"].apply(fmt)
-        dp["貸借倍率"] = Ld["貸借倍率"].apply(
-            lambda v: "-" if pd.isna(v) else "∞" if abs(v)==float("inf") else f"{v:.2f}倍")
-        dp["逆日歩"] = Ld["逆日歩"].apply(
-            lambda v: f"{v:.2f}" if pd.notna(v) and v > 0 else "-")
-        av = {c:"" for c in LCOLS}; av["申込日"]="【平均】"
+        LCOLS=["申込日","買い残高","買い残高(信用%)","買い増減","買い新規","買い返済",
+               "売り残高","売り残高(信用%)","売り増減","売り新規","売り返済","貸借倍率","逆日歩"]
+        LNUM=["買い残高","買い増減","買い新規","買い返済","売り残高","売り増減","売り新規","売り返済"]
+        Ld=L.sort_values("_dt",ascending=False).reset_index(drop=True)
+        Ld["差引残高"]=Ld["買い残高"].fillna(0)-Ld["売り残高"].fillna(0)
+        dp=pd.DataFrame(); dp["申込日"]=Ld["申込日"]
+        for c in LNUM: dp[c]=Ld[c].apply(fmt) if c in Ld.columns else "-"
+        dp["買い残高(信用%)"]=Ld["買い残高"].apply(
+            lambda v:f"{float(v)/lmb*100:.1f}%" if pd.notna(v) and lmb and lmb>0 else "-")
+        dp["売り残高(信用%)"]=Ld["売り残高"].apply(
+            lambda v:f"{float(v)/lms*100:.1f}%" if pd.notna(v) and lms and lms>0 else "-")
+        dp["貸借倍率"]=Ld["貸借倍率"].apply(
+            lambda v:"-" if pd.isna(v) else "∞" if abs(v)==float("inf") else f"{v:.2f}倍")
+        dp["逆日歩"]=Ld["逆日歩"].apply(lambda v:f"{v:.2f}" if pd.notna(v) and v>0 else "-")
+        av={c:"" for c in LCOLS}; av["申込日"]="【平均】"
         for c in LNUM: av[c]=fmt(Ld[c].mean(skipna=True))
         av["貸借倍率"]=fmt(Ld["貸借倍率"].replace([float("inf"),float("-inf")],float("nan")).mean(skipna=True),dec=2,suffix="倍")
         av["逆日歩"]=fmt(Ld["逆日歩"].mean(skipna=True),dec=2)
-        if latest_margin_buy and latest_margin_buy>0:
-            av["買い残高(信用%)"]=f"{Ld['買い残高'].mean(skipna=True)/latest_margin_buy*100:.1f}%"
-        if latest_margin_sel and latest_margin_sel>0:
-            av["売り残高(信用%)"]=f"{Ld['売り残高'].mean(skipna=True)/latest_margin_sel*100:.1f}%"
+        if lmb and lmb>0: av["買い残高(信用%)"]=f"{Ld['買い残高'].mean(skipna=True)/lmb*100:.1f}%"
+        if lms and lms>0: av["売り残高(信用%)"]=f"{Ld['売り残高'].mean(skipna=True)/lms*100:.1f}%"
         disp_l=pd.concat([dp[LCOLS],pd.DataFrame([av])],ignore_index=True)
         st_l=cell_style(disp_l,Ld,"申込日",LNUM,neg_red=["差引残高"])
         for idx in disp_l[disp_l["申込日"]!="【平均】"].index:
@@ -308,47 +270,39 @@ def render_stock(code: str, info: dict, col_hex: str):
             for c in ["買い残高(信用%)","売り残高(信用%)"]:
                 if st_l.loc[idx,c]=="": st_l.loc[idx,c]="color:#8b949e;font-size:11px"
         st.dataframe(disp_l.style.apply(lambda _:st_l,axis=None),
-            use_container_width=True,hide_index=True,height=min(38*(len(disp_l)+1)+38,560))
-
-    # ── ② 週次信用残 ─────────────────────────────────
-    st.markdown("<h3 style='color:#f0f6fc;font-size:14px;margin:14px 0 4px'>"
-                "② 週次信用残（直近順）</h3>", unsafe_allow_html=True)
-    st.caption("🔴赤=信用倍率1倍未満 ／ 🟡橙=平均3倍超 ／ 🟠逆日歩発生 ／ 消化日数：残高÷日次平均出来高")
-
-    if M.empty:
-        st.warning("信用残データを取得できませんでした。")
+            use_container_width=True,hide_index=True,height=min(38*(len(disp_l)+1)+38,520))
     else:
-        Ma = M.sort_values("_dt", ascending=True)
-        fig2 = make_subplots(rows=1, cols=1)
-        fig2.add_trace(go.Scatter(x=Ma["日付"], y=Ma["買い残高"], name="買い残高",
-            line=dict(color="#388bfd", width=2), fill="tozeroy",
-            fillcolor="rgba(56,139,253,0.12)",
-            hovertemplate="%{x}<br>買い残高:%{y:,.0f}<extra></extra>"))
-        fig2.add_trace(go.Scatter(x=Ma["日付"], y=Ma["売り残高"], name="売り残高",
-            line=dict(color="#f85149", width=2), fill="tozeroy",
-            fillcolor="rgba(248,81,73,0.12)",
-            hovertemplate="%{x}<br>売り残高:%{y:,.0f}<extra></extra>"))
-        fig_base(fig2, 260); st.plotly_chart(fig2, use_container_width=True)
+        st.info("① 貸借データなし（投資信託・指数はスキップ）")
 
-        daily_vol_avg = P["出来高"].mean() if not P.empty else None
-        MCOLS=["日付","買い残高","買い残消化日数","買い増減",
-               "売り残高","売り残消化日数","売り増減","信用需給ネット",
-               "信用倍率","買い残増減率","売り残増減率","逆日歩"]
+    # ② 週次信用残
+    if not M.empty:
+        st.markdown("**② 週次信用残**")
+        Ma=M.sort_values("_dt",ascending=True)
+        fig2=make_subplots(rows=1,cols=1)
+        fig2.add_trace(go.Scatter(x=Ma["日付"],y=Ma["買い残高"],name="買い残高",
+            line=dict(color="#388bfd",width=2),fill="tozeroy",fillcolor="rgba(56,139,253,0.12)",
+            hovertemplate="%{x}<br>%{y:,.0f}<extra></extra>"))
+        fig2.add_trace(go.Scatter(x=Ma["日付"],y=Ma["売り残高"],name="売り残高",
+            line=dict(color="#f85149",width=2),fill="tozeroy",fillcolor="rgba(248,81,73,0.12)",
+            hovertemplate="%{x}<br>%{y:,.0f}<extra></extra>"))
+        fig_base(fig2,240); st.plotly_chart(fig2,use_container_width=True)
+
+        dv_avg=P["出来高"].mean() if not P.empty else None
+        MCOLS=["日付","買い残高","買い残消化日数","買い増減","売り残高","売り残消化日数",
+               "売り増減","信用需給ネット","信用倍率","買い残増減率","売り残増減率","逆日歩"]
         MNUM=["買い残高","買い増減","売り残高","売り増減","信用倍率","買い残増減率","売り残増減率"]
         Md=M.sort_values("_dt",ascending=False).reset_index(drop=True)
-        Md["買い残消化日数_num"]=Md["買い残高"].apply(
-            lambda v: float(v)/daily_vol_avg if pd.notna(v) and daily_vol_avg else float("nan"))
-        Md["売り残消化日数_num"]=Md["売り残高"].apply(
-            lambda v: float(v)/daily_vol_avg if pd.notna(v) and daily_vol_avg else float("nan"))
-        Md["信用需給ネット_num"]=Md["買い残消化日数_num"]-Md["売り残消化日数_num"]
+        Md["買い残消化日数_n"]=Md["買い残高"].apply(lambda v:float(v)/dv_avg if pd.notna(v) and dv_avg else float("nan"))
+        Md["売り残消化日数_n"]=Md["売り残高"].apply(lambda v:float(v)/dv_avg if pd.notna(v) and dv_avg else float("nan"))
+        Md["信用需給ネット_n"]=Md["買い残消化日数_n"]-Md["売り残消化日数_n"]
         dm=pd.DataFrame(); dm["日付"]=Md["日付"]
         dm["買い残高"]=Md["買い残高"].apply(fmt)
-        dm["買い残消化日数"]=Md["買い残消化日数_num"].apply(lambda v:f"{v:.1f}日" if pd.notna(v) else "-")
+        dm["買い残消化日数"]=Md["買い残消化日数_n"].apply(lambda v:f"{v:.1f}日" if pd.notna(v) else "-")
         dm["買い増減"]=Md["買い増減"].apply(fmt)
         dm["売り残高"]=Md["売り残高"].apply(fmt)
-        dm["売り残消化日数"]=Md["売り残消化日数_num"].apply(lambda v:f"{v:.1f}日" if pd.notna(v) else "-")
+        dm["売り残消化日数"]=Md["売り残消化日数_n"].apply(lambda v:f"{v:.1f}日" if pd.notna(v) else "-")
         dm["売り増減"]=Md["売り増減"].apply(fmt)
-        dm["信用需給ネット"]=Md["信用需給ネット_num"].apply(lambda v:f"{v:+.1f}日" if pd.notna(v) else "-")
+        dm["信用需給ネット"]=Md["信用需給ネット_n"].apply(lambda v:f"{v:+.1f}日" if pd.notna(v) else "-")
         dm["信用倍率"]=Md["信用倍率"].apply(lambda v:f"{v:.2f}倍" if pd.notna(v) else "-")
         dm["買い残増減率"]=Md["買い残増減率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
         dm["売り残増減率"]=Md["売り残増減率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
@@ -358,148 +312,323 @@ def render_stock(code: str, info: dict, col_hex: str):
         av_m["信用倍率"]=fmt(Md["信用倍率"].mean(skipna=True),dec=2,suffix="倍")
         for c in ["買い残増減率","売り残増減率"]:
             v2=Md[c].mean(skipna=True); av_m[c]=f"{v2:+.2f}%" if pd.notna(v2) else "-"
-        if daily_vol_avg:
-            av_m["買い残消化日数"]=f"{Md['買い残消化日数_num'].mean(skipna=True):.1f}日"
-            av_m["売り残消化日数"]=f"{Md['売り残消化日数_num'].mean(skipna=True):.1f}日"
-            av_m["信用需給ネット"]=f"{Md['信用需給ネット_num'].mean(skipna=True):+.1f}日"
+        if dv_avg:
+            av_m["買い残消化日数"]=f"{Md['買い残消化日数_n'].mean(skipna=True):.1f}日"
+            av_m["売り残消化日数"]=f"{Md['売り残消化日数_n'].mean(skipna=True):.1f}日"
+            av_m["信用需給ネット"]=f"{Md['信用需給ネット_n'].mean(skipna=True):+.1f}日"
         disp_m=pd.concat([dm[MCOLS],pd.DataFrame([av_m])],ignore_index=True)
         st_m=cell_style(disp_m,Md,"日付",MNUM,thr=3.0)
         for idx in disp_m[disp_m["日付"]!="【平均】"].index:
-            dv=disp_m.loc[idx,"日付"]
-            orig=Md.loc[Md["日付"]==dv,"信用倍率"]
+            dv2=disp_m.loc[idx,"日付"]
+            orig=Md.loc[Md["日付"]==dv2,"信用倍率"]
             if not orig.empty and pd.notna(orig.values[0]) and orig.values[0]<1:
                 st_m.loc[idx,"信用倍率"]="background-color:#3d1a1a;color:#f85149;font-weight:700"
-            orig2=Md.loc[Md["日付"]==dv,"逆日歩"]
+            orig2=Md.loc[Md["日付"]==dv2,"逆日歩"]
             if not orig2.empty and pd.notna(orig2.values[0]) and orig2.values[0]>0:
                 st_m.loc[idx,"逆日歩"]="background-color:#2d1f00;color:#e3b341;font-weight:700"
-            for c in ["買い残増減率","売り残増減率"]:
-                if st_m.loc[idx,c]!="": continue
-                o3=Md.loc[Md["日付"]==dv,c]
-                if not o3.empty and pd.notna(o3.values[0]):
-                    st_m.loc[idx,c]=f"color:{vc(o3.values[0])}"
-            for col_n,num_col in [("買い残消化日数","買い残消化日数_num"),("売り残消化日数","売り残消化日数_num")]:
-                bd=Md.loc[Md["日付"]==dv,num_col]
-                if not bd.empty and pd.notna(bd.values[0]):
-                    bv=bd.values[0]
-                    if bv>100: st_m.loc[idx,col_n]="background-color:#2d1f00;color:#e3b341;font-weight:700"
-                    elif bv>20: st_m.loc[idx,col_n]="background-color:#3d1a1a;color:#f85149;font-weight:700"
-            nd=Md.loc[Md["日付"]==dv,"信用需給ネット_num"]
+            for c in ["買い残増減率","売い残増減率","買い残消化日数","売り残消化日数"]:
+                if c not in disp_m.columns: continue
+                if c in ["買い残消化日数","売り残消化日数"]:
+                    nc=c+"_n" if c+"_n" in Md.columns else c.replace("消化日数","残消化日数_n")
+                    nc="買い残消化日数_n" if "買い" in c else "売り残消化日数_n"
+                    bd=Md.loc[Md["日付"]==dv2,nc]
+                    if not bd.empty and pd.notna(bd.values[0]):
+                        bv=bd.values[0]
+                        if bv>100: st_m.loc[idx,c]="background-color:#2d1f00;color:#e3b341;font-weight:700"
+                        elif bv>20: st_m.loc[idx,c]="background-color:#3d1a1a;color:#f85149;font-weight:700"
+                elif st_m.loc[idx,c]=="":
+                    o3=Md.loc[Md["日付"]==dv2,c]
+                    if not o3.empty and pd.notna(o3.values[0]):
+                        st_m.loc[idx,c]=f"color:{vc(o3.values[0])}"
+            nd=Md.loc[Md["日付"]==dv2,"信用需給ネット_n"]
             if not nd.empty and pd.notna(nd.values[0]) and st_m.loc[idx,"信用需給ネット"]=="":
                 st_m.loc[idx,"信用需給ネット"]=f"color:{NEG if nd.values[0]>0 else POS};font-weight:600"
         st.dataframe(disp_m.style.apply(lambda _:st_m,axis=None),
-            use_container_width=True,hide_index=True,height=min(38*(len(disp_m)+1)+38,520))
-        if daily_vol_avg:
-            st.caption(f"※消化日数=残高÷日次平均出来高({daily_vol_avg/1e6:.1f}M株/日)　"
-                       "🔴赤=20日超 ／ 🟡橙=100日超　信用需給ネット：プラス=売り圧力 / マイナス=踏み上げ余地")
+            use_container_width=True,hide_index=True,height=min(38*(len(disp_m)+1)+38,480))
+        if dv_avg: st.caption(f"※消化日数=残高÷日次平均出来高({dv_avg/1e6:.1f}M) 🔴20日超 🟡100日超")
+    else:
+        st.info("② 週次信用残データなし（投資信託・指数はスキップ）")
 
-    # ── ③ 株価急変 ＋ 出来高 ──────────────────────────
-    st.markdown("<h3 style='color:#f0f6fc;font-size:14px;margin:14px 0 4px'>"
-                "③ 株価急変 ＋ 出来高（直近順）</h3>", unsafe_allow_html=True)
-    st.caption("🔴★=大口機関の可能性 ／ 🟡=出来高月平均×2超 ／ 25日乖離・PER・PBR付き")
-    with st.expander("🔍 大口機関の可能性（🔴★）の判定定義", expanded=False):
-        st.markdown("""
-| 条件 | 内容 |
-|---|---|
-| ① 大量売買＋価格インパクト | 出来高が月平均の **2倍超** かつ 前日比 **±1.5%以上** |
-| ② 急騰・急落＋出来高急増 | 前日比 **±4%以上** かつ 出来高が月平均の **1.5倍超** |
-| ③ 日中値幅急拡大 | 当日の高値−安値が過去5日平均値幅の **2倍超** |
-> ①〜③のいずれかを満たした場合に 🔴機関 と判定。確定的な判断には別途分析が必要です。
-        """)
+    # ③ 株価急変＋出来高（比較機能付き）
+    st.markdown("**③ 株価急変 ＋ 出来高 ＋ 比較分析**")
+    with st.expander("🔍 大口機関判定定義",expanded=False):
+        st.markdown("① 出来高×2超かつ前日比±1.5%以上 ② 前日比±4%以上かつ出来高×1.5超 ③ 日中値幅が5日平均の2倍超")
 
     if P.empty:
-        st.warning("株価データを取得できませんでした。")
-    else:
-        vm=P["出来高平均"].iloc[0]; Pa=P.sort_values("_dt",ascending=True)
-        fig3=make_subplots(rows=2,cols=1,shared_xaxes=True,
-            row_heights=[0.65,0.35],vertical_spacing=0.04)
-        mc2=["#f85149" if a else col_hex for a in Pa["機関異常"]]
-        ms2=[10 if a else 5 for a in Pa["機関異常"]]
-        sym=["star" if a else "circle" for a in Pa["機関異常"]]
-        fig3.add_trace(go.Scatter(x=Pa["日付"],y=Pa["終値"],mode="lines+markers",name="終値",
-            line=dict(color=col_hex,width=2),
-            marker=dict(size=ms2,color=mc2,symbol=sym,
-                line=dict(width=1.5,color="rgba(248,81,73,0.4)")),
-            hovertemplate="日付:%{x}<br>終値:¥%{y:,.1f}<extra></extra>"),row=1,col=1)
-        for _,r in Pa[Pa["機関異常"]].iterrows():
-            chg=r.get("前日比%",float("nan"))
-            fig3.add_annotation(x=r["日付"],y=r["終値"],
-                text=f"<b>{chg:+.1f}%</b>" if pd.notna(chg) else "<b>⚠</b>",
-                showarrow=True,arrowhead=2,arrowcolor="#f85149",
-                font=dict(color="#f85149",size=10),bgcolor="#0d1117",bordercolor="#f85149")
-        bc3=["#f85149" if r["機関異常"] else "#e3b341" if r["出来高異常"] else col_hex
-             for _,r in Pa.iterrows()]
-        fig3.add_trace(go.Bar(x=Pa["日付"],y=Pa["出来高"],name="出来高",
-            marker_color=bc3,opacity=0.85,
-            hovertemplate="日付:%{x}<br>出来高:%{y:,.0f}<extra></extra>"),row=2,col=1)
-        fig3.add_hline(y=vm,line_dash="dot",line_color="#8b949e",
-            annotation_text=f"月平均 {vm/1e6:.1f}M",annotation_font_color="#8b949e",row=2,col=1)
-        fig3.add_hline(y=vm*2,line_dash="dash",line_color="#e3b341",
-            annotation_text="×2",annotation_font_color="#e3b341",row=2,col=1)
-        fig_base(fig3,420); st.plotly_chart(fig3,use_container_width=True)
+        st.warning("株価データを取得できませんでした。"); return
 
-        raw_p={c:P[c].copy() for c in ["始値","高値","安値","終値","出来高","前日比%","25日乖離率","PER","PBR"]}
-        pt=pd.DataFrame(); pt["日付"]=P["日付"]
-        pt["始値"]=raw_p["始値"].apply(lambda v:f"¥{v:,.1f}" if pd.notna(v) else "-")
-        pt["高値"]=raw_p["高値"].apply(lambda v:f"¥{v:,.1f}" if pd.notna(v) else "-")
-        pt["安値"]=raw_p["安値"].apply(lambda v:f"¥{v:,.1f}" if pd.notna(v) else "-")
-        pt["終値"]=raw_p["終値"].apply(lambda v:f"¥{v:,.1f}" if pd.notna(v) else "-")
-        pt["前日比%"]=raw_p["前日比%"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
-        pt["25日乖離率"]=raw_p["25日乖離率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
-        pt["PER"]=raw_p["PER"].apply(lambda v:f"{v:.2f}倍" if pd.notna(v) else "-")
-        pt["PBR"]=raw_p["PBR"].apply(lambda v:f"{v:.2f}倍" if pd.notna(v) else "-")
-        pt["株価判定"]=P["機関異常"].map({True:"🔴 機関",False:"✅ 通常"})
-        pt["出来高"]=raw_p["出来高"].apply(lambda v:f"{int(v):,}" if pd.notna(v) else "-")
-        pt["出来高判定"]=P["出来高異常"].map({True:"🟠 急増",False:"✅ 通常"})
-        sc=["日付","始値","高値","安値","終値","前日比%","25日乖離率","PER","PBR","株価判定","出来高","出来高判定"]
-        ar={"日付":"【平均】",
-            "始値":f"¥{raw_p['始値'].mean():,.1f}","高値":f"¥{raw_p['高値'].mean():,.1f}",
-            "安値":f"¥{raw_p['安値'].mean():,.1f}","終値":f"¥{raw_p['終値'].mean():,.1f}",
-            "前日比%":f"{raw_p['前日比%'].mean(skipna=True):+.2f}%",
-            "25日乖離率":f"{raw_p['25日乖離率'].mean(skipna=True):+.2f}%",
-            "PER":f"{raw_p['PER'].mean(skipna=True):.2f}倍",
-            "PBR":f"{raw_p['PBR'].mean(skipna=True):.2f}倍",
-            "株価判定":"","出来高":f"{int(raw_p['出来高'].mean()):,}",
-            "出来高判定":f"月平均 {vm/1e6:.1f}M"}
-        pt_show=pd.concat([pt[sc],pd.DataFrame([ar])],ignore_index=True)
-        def sty_p(row):
-            if row["日付"]=="【平均】":
-                return ["background-color:#1c2951;font-weight:700;color:#e3b341"]*len(row)
-            if row.get("株価判定")=="🔴 機関":
-                return ["background-color:#2d1014;color:#ffa198"]*len(row)
-            if row.get("出来高判定")=="🟠 急増":
-                return ["background-color:#2d1f00;color:#e3b341"]*len(row)
-            styles=[""]*len(row); cols_l=list(row.index)
-            for cn,rc in [("前日比%","前日比%"),("25日乖離率","25日乖離率")]:
-                if cn in cols_l:
-                    i=cols_l.index(cn)
-                    orig=P.loc[P["日付"]==row["日付"],rc]
-                    if not orig.empty and pd.notna(orig.values[0]):
-                        styles[i]=f"color:{vc(orig.values[0])};font-weight:600"
-            return styles
-        st.dataframe(pt_show.style.apply(sty_p,axis=1),use_container_width=True,hide_index=True)
+    cmp_key = f"cmp_{code}"
+    if cmp_key not in st.session_state: st.session_state[cmp_key] = {}
+    cmp_data = st.session_state[cmp_key]
 
+    # ── 固定ボタン群 ──────────────────────────────
+    PRESET = [
+        # (ラベル, 表示名, URL)
+        ("NDX",       "NASDAQ100",        "https://us.kabutan.jp/indexes/%5ENDX/historical_prices/daily"),
+        ("SOX",       "SOX",              "https://us.kabutan.jp/indexes/%5ESOX/historical_prices/daily"),
+        ("IXIC",      "NASDAQ",           "https://us.kabutan.jp/indexes/%5EIXIC/historical_prices/daily"),
+        ("DJI",       "NYダウ",           "https://us.kabutan.jp/indexes/%5EDJI/historical_prices/daily"),
+        ("03311187",  "S&P500(eMAXIS)",   "https://finance.yahoo.co.jp/quote/03311187/history"),
+        ("0331418A",  "全世界株(eMAXIS)", "https://finance.yahoo.co.jp/quote/0331418A/history"),
+        ("998405.T",  "TOPIX",            "https://finance.yahoo.co.jp/quote/998405.T/history"),
+        ("998407.O",  "日経平均",         "https://finance.yahoo.co.jp/quote/998407.O/history"),
+    ]
 
-# ════════════════════════════════════════
-# メイン：タブを動的生成
-# ════════════════════════════════════════
-codes  = list(st.session_state.watch_list.keys())
-labels = [f"{c} {st.session_state.watch_list[c].get('name','')}" for c in codes]
+    st.caption("📌 クイック比較追加（ワンタッチ）")
+    btn_cols = st.columns(4)
+    for bi, (pcode, pname, purl) in enumerate(PRESET):
+        with btn_cols[bi % 4]:
+            if st.button(f"＋{pname}",key=f"preset_{code}_{pcode}"):
+                if pcode not in cmp_data:
+                    with st.spinner(f"{pname} 取得中…"):
+                        df_tmp = fetch_price_by_url(purl, pname)
+                    if not df_tmp.empty:
+                        cmp_data[pcode] = {"name": pname, "price": df_tmp}
+                        st.success(f"✅ {pname} を追加")
+                    else:
+                        st.error(f"❌ {pname} のデータを取得できませんでした")
+                st.rerun()
 
-if not codes:
-    st.info("ウォッチリストが空です。上の検索フォームから銘柄を追加してください。")
-    st.stop()
+    # ── 自由検索フォーム（名前またはコード） ──────
+    st.caption("🔍 その他の銘柄を比較追加（コードまたはURL直接入力）")
+    with st.form(f"compare_form_{code}", clear_on_submit=True):
+        cc1, cc2, cc3 = st.columns([2, 2, 1])
+        with cc1:
+            cmp_inp = st.text_input(
+                "コード", placeholder="例：9I31115A / NDX / 7203",
+                label_visibility="collapsed")
+        with cc2:
+            cmp_url = st.text_input(
+                "URL（省略可）", placeholder="例：https://finance.yahoo.co.jp/quote/9I31115A/history",
+                label_visibility="collapsed")
+        with cc3:
+            cmp_btn = st.form_submit_button("📈 追加", use_container_width=True)
 
-tabs = st.tabs(labels)
-for tab, code in zip(tabs, codes):
-    col_hex = COLORS[codes.index(code) % len(COLORS)]
-    info    = st.session_state.stock_data.get(code)
-    with tab:
-        if not info:
-            st.warning(f"{code} のデータがありません。最新化ボタンを押してください。")
+    if cmp_btn and (cmp_inp or cmp_url):
+        cmp_code_raw = _normalize(cmp_inp) if cmp_inp else ""
+        with st.spinner("取得中…"):
+            if cmp_url:
+                # URL直接指定
+                df_tmp = fetch_price_by_url(cmp_url.strip())
+                cmp_label = cmp_inp.strip() or re.search(r"/quote/([^/]+)/", cmp_url or "") or cmp_url.split("/")[-2]
+                if hasattr(cmp_label, "group"): cmp_label = cmp_label.group(1)
+            else:
+                # コードから自動判定
+                info_tmp = fetch_one(cmp_code_raw)
+                df_tmp = info_tmp["price"]
+                cmp_label = info_tmp["name"] or cmp_code_raw
+        if not df_tmp.empty:
+            key_label = cmp_url.strip() if cmp_url and not cmp_code_raw else cmp_code_raw
+            cmp_data[key_label] = {"name": str(cmp_label), "price": df_tmp}
+            st.success(f"✅ {cmp_label} を比較に追加")
         else:
-            render_stock(code, info, col_hex)
+            st.error("❌ データを取得できませんでした。URLを直接指定してください。")
 
-# ── フッター ──────────────────────────────────────────
+    # 追加済み比較銘柄の削除ボタン
+    if cmp_data:
+        rc = st.columns(min(len(cmp_data), 5))
+        for i, (cc, ci) in enumerate(list(cmp_data.items())):
+            with rc[i % 5]:
+                if st.button(f"✕ {ci['name']}", key=f"rmcmp_{code}_{cc}"):
+                    cmp_data.pop(cc, None); st.rerun()
+
+    vm = P["出来高平均"].iloc[0]
+    Pa = P.sort_values("_dt", ascending=True)
+
+    # ── グラフ ────────────────────────────────────
+    use_relative = len(cmp_data) > 0
+    fig3 = make_subplots(rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.65, 0.35], vertical_spacing=0.04)
+
+    base_val = Pa["終値"].iloc[0] if not Pa.empty else None
+    y_label = "相対値（基準=100）" if use_relative else "終値"
+
+    def to_rel(s, bv):
+        return (s / bv * 100).round(4) if (use_relative and bv) else s
+
+    main_s = Pa.set_index("日付")["終値"]
+    y_main = to_rel(main_s, base_val)
+    mc2 = ["#f85149" if a else col_hex for a in Pa["機関異常"]]
+    ms2 = [10 if a else 5 for a in Pa["機関異常"]]
+    sym = ["star" if a else "circle" for a in Pa["機関異常"]]
+    fig3.add_trace(go.Scatter(x=y_main.index, y=y_main.values,
+        mode="lines+markers", name=f"{code} {info['name']}",
+        line=dict(color=col_hex, width=2),
+        marker=dict(size=ms2, color=mc2, symbol=sym,
+            line=dict(width=1.5, color="rgba(248,81,73,0.4)")),
+        hovertemplate=f"%{{x}}<br>{y_label}:%{{y:,.2f}}<extra></extra>"),
+        row=1, col=1)
+
+    for idx_c, (cc, ci) in enumerate(cmp_data.items()):
+        cp = ci["price"].sort_values("_dt", ascending=True)
+        if cp.empty: continue
+        cp_s = cp.set_index("日付")["終値"]
+        y_c = to_rel(cp_s, cp_s.iloc[0])
+        cc_color = COLORS[(idx_c + 1) % len(COLORS)]
+        fig3.add_trace(go.Scatter(x=y_c.index, y=y_c.values,
+            mode="lines", name=f"{cc} {ci['name']}",
+            line=dict(color=cc_color, width=1.5, dash="dash"),
+            hovertemplate=f"%{{x}}<br>{y_label}:%{{y:,.2f}}<extra></extra>"),
+            row=1, col=1)
+
+    for _, r in Pa[Pa["機関異常"]].iterrows():
+        chg = r.get("前日比%", float("nan"))
+        fig3.add_annotation(x=r["日付"], y=y_main.get(r["日付"], r["終値"]),
+            text=f"<b>{chg:+.1f}%</b>" if pd.notna(chg) else "<b>⚠</b>",
+            showarrow=True, arrowhead=2, arrowcolor="#f85149",
+            font=dict(color="#f85149", size=10),
+            bgcolor="#0d1117", bordercolor="#f85149")
+
+    bc3 = ["#f85149" if r["機関異常"] else "#e3b341" if r["出来高異常"] else col_hex
+           for _, r in Pa.iterrows()]
+    fig3.add_trace(go.Bar(x=Pa["日付"], y=Pa["出来高"], name="出来高",
+        marker_color=bc3, opacity=0.85,
+        hovertemplate="%{x}<br>%{y:,.0f}<extra></extra>"), row=2, col=1)
+    fig3.add_hline(y=vm, line_dash="dot", line_color="#8b949e",
+        annotation_text=f"月平均 {vm/1e6:.1f}M",
+        annotation_font_color="#8b949e", row=2, col=1)
+    fig3.add_hline(y=vm*2, line_dash="dash", line_color="#e3b341",
+        annotation_text="×2", annotation_font_color="#e3b341", row=2, col=1)
+    if use_relative:
+        fig3.update_yaxes(title_text="相対値(基準=100)", row=1, col=1)
+    fig_base(fig3, 440); st.plotly_chart(fig3, use_container_width=True)
+
+    # ── 主銘柄 株価テーブル ───────────────────────
+    cols_p = ["始値","高値","安値","終値","出来高","前日比%","25日乖離率","PER","PBR","基準価額"]
+    raw_p = {c: P[c].copy() for c in cols_p}
+    pt = pd.DataFrame(); pt["日付"] = P["日付"]
+    for c in ["始値","高値","安値","終値","基準価額"]:
+        pt[c] = raw_p[c].apply(lambda v: f"¥{v:,.1f}" if pd.notna(v) else "-")
+    pt["前日比%"]   = raw_p["前日比%"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
+    pt["25日乖離率"] = raw_p["25日乖離率"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
+    pt["PER"]       = raw_p["PER"].apply(lambda v: f"{v:.2f}倍" if pd.notna(v) else "-")
+    pt["PBR"]       = raw_p["PBR"].apply(lambda v: f"{v:.2f}倍" if pd.notna(v) else "-")
+    pt["株価判定"]   = P["機関異常"].map({True:"🔴 機関", False:"✅ 通常"})
+    pt["出来高"]     = raw_p["出来高"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "-")
+    pt["出来高判定"]  = P["出来高異常"].map({True:"🟠 急増", False:"✅ 通常"})
+    sc = ["日付","始値","高値","安値","終値","基準価額","前日比%","25日乖離率","PER","PBR",
+          "株価判定","出来高","出来高判定"]
+    def safe_m(col):
+        m = raw_p[col].mean(skipna=True)
+        return f"¥{m:,.1f}" if pd.notna(m) else "-"
+    def safe_pct(col):
+        m = raw_p[col].mean(skipna=True)
+        return f"{m:+.2f}%" if pd.notna(m) else "-"
+    ar = {"日付":"【平均】",
+          "始値":safe_m("始値"),"高値":safe_m("高値"),"安値":safe_m("安値"),
+          "終値":safe_m("終値"),"基準価額":safe_m("基準価額"),
+          "前日比%":safe_pct("前日比%"),"25日乖離率":safe_pct("25日乖離率"),
+          "PER": f"{raw_p['PER'].mean(skipna=True):.2f}倍" if pd.notna(raw_p['PER'].mean(skipna=True)) else "-",
+          "PBR": f"{raw_p['PBR'].mean(skipna=True):.2f}倍" if pd.notna(raw_p['PBR'].mean(skipna=True)) else "-",
+          "株価判定":"",
+          "出来高": f"{int(raw_p['出来高'].mean()):,}" if pd.notna(raw_p['出来高'].mean()) else "-",
+          "出来高判定": f"月平均 {vm/1e6:.1f}M"}
+    pt_show = pd.concat([pt[sc], pd.DataFrame([ar])], ignore_index=True)
+
+    def sty_p(row):
+        if row["日付"]=="【平均】": return ["background-color:#1c2951;font-weight:700;color:#e3b341"]*len(row)
+        if row.get("株価判定")=="🔴 機関": return ["background-color:#2d1014;color:#ffa198"]*len(row)
+        if row.get("出来高判定")=="🟠 急増": return ["background-color:#2d1f00;color:#e3b341"]*len(row)
+        styles=[""]*len(row); cl=list(row.index)
+        for cn in ["前日比%","25日乖離率"]:
+            if cn in cl:
+                i=cl.index(cn); orig=P.loc[P["日付"]==row["日付"],cn]
+                if not orig.empty and pd.notna(orig.values[0]):
+                    styles[i]=f"color:{vc(orig.values[0])};font-weight:600"
+        return styles
+
+    st.dataframe(pt_show.style.apply(sty_p, axis=1),
+        use_container_width=True, hide_index=True)
+
+    # ── 比較テーブル（拡充版） ────────────────────
+    if cmp_data:
+        st.markdown("**📊 比較テーブル（各銘柄の詳細＋乖離率）**")
+        st.caption(
+            "相対値：各銘柄の最古日を100として正規化。乖離率(vs主)＝比較銘柄相対値－主銘柄相対値。"
+            "β係数：比較銘柄の日次リターンと主銘柄の相関（1=同方向、-1=逆方向）"
+        )
+        # 主銘柄の日次リターン
+        main_ret = Pa.set_index("日付")["終値"].pct_change().dropna()
+
+        for cc, ci in cmp_data.items():
+            cp = ci["price"].sort_values("_dt", ascending=True)
+            if cp.empty: continue
+            cp_idx = cp.set_index("日付")
+
+            st.markdown(f"##### {cc} {ci['name']}")
+            rows_cmp = []
+            cp_base = cp_idx["終値"].iloc[0]
+            main_base2 = Pa["終値"].iloc[0]
+
+            for _, crow in cp.sort_values("_dt", ascending=False).iterrows():
+                d = crow["日付"]
+                # 主銘柄の同日データ
+                main_row = Pa.loc[Pa["日付"]==d]
+                main_close = main_row["終値"].values[0] if not main_row.empty else None
+                main_rel = (main_close/main_base2*100) if main_close else None
+                cmp_rel  = (crow["終値"]/cp_base*100) if pd.notna(crow["終値"]) else None
+                drift    = (cmp_rel - main_rel) if (cmp_rel is not None and main_rel is not None) else None
+
+                # 対象銘柄の各列
+                def fv(col): return crow.get(col, float("nan"))
+                rows_cmp.append({
+                    "日付":          d,
+                    "終値":          f"¥{fv('終値'):,.1f}"    if pd.notna(fv("終値"))    else "-",
+                    "基準価額":      f"¥{fv('基準価額'):,.1f}" if pd.notna(fv("基準価額")) else "-",
+                    "前日比%":       f"{fv('前日比%'):+.2f}%"  if pd.notna(fv("前日比%")) else "-",
+                    "25日乖離率":    f"{fv('25日乖離率'):+.2f}%"if pd.notna(fv("25日乖離率"))else "-",
+                    "始値":          f"¥{fv('始値'):,.1f}"    if pd.notna(fv("始値"))    else "-",
+                    "高値":          f"¥{fv('高値'):,.1f}"    if pd.notna(fv("高値"))    else "-",
+                    "安値":          f"¥{fv('安値'):,.1f}"    if pd.notna(fv("安値"))    else "-",
+                    "出来高":        f"{int(fv('出来高')):,}"   if pd.notna(fv("出来高"))  else "-",
+                    "相対値":        f"{cmp_rel:.2f}"           if cmp_rel is not None     else "-",
+                    f"乖離率(vs {code})": f"{drift:+.2f}"      if drift is not None        else "-",
+                })
+
+            if not rows_cmp: continue
+            df_cmp = pd.DataFrame(rows_cmp)
+
+            # β係数（期間全体）
+            cmp_ret = cp_idx["終値"].pct_change().dropna()
+            common  = main_ret.index.intersection(cmp_ret.index)
+            if len(common) >= 5:
+                mr = main_ret[common]; cr = cmp_ret[common]
+                beta = cr.cov(mr) / mr.var() if mr.var() > 0 else float("nan")
+                corr = cr.corr(mr)
+                st.caption(f"β係数（対主銘柄）: **{beta:.3f}**　相関係数: **{corr:.3f}**　"
+                           f"（β>1=主銘柄より変動大 / β<0=逆相関）")
+
+            drift_col = f"乖離率(vs {code})"
+            def sty_cmp(row):
+                styles=[""] * len(row)
+                cl=list(row.index)
+                for cn in ["前日比%","25日乖離率",drift_col]:
+                    if cn in cl:
+                        i=cl.index(cn)
+                        try:
+                            v=float(str(row[cn]).replace("%","").replace("+",""))
+                            styles[i]=f"color:{POS if v>=0 else NEG};font-weight:600"
+                        except: pass
+                return styles
+
+            st.dataframe(df_cmp.style.apply(sty_cmp, axis=1),
+                use_container_width=True, hide_index=True,
+                height=min(38*(len(df_cmp)+1)+38, 420))
+
+
+# ════════════════════════════════════════
+# メイン：タブ描画
+# ════════════════════════════════════════
+codes=list(wl.keys())
+labels=[f"{c} {wl[c].get('name','')}" for c in codes]
+tabs=st.tabs(labels)
+for tab,code in zip(tabs,codes):
+    col_hex=COLORS[codes.index(code)%len(COLORS)]
+    info=st.session_state.stock_data.get(code)
+    with tab:
+        if not info: st.warning(f"{code} のデータがありません。")
+        else: render_stock(code,info,col_hex)
+
 st.markdown("<p style='text-align:center;font-size:10px;color:#484f58;margin-top:8px'>"
-    "全データ出典：IRバンク(irbank.net) ｜ 投資勧誘を目的としません</p>",
+    "出典：IRバンク / 日証金 / Yahoo Finance Japan / kabutan.jp ｜ 投資勧誘を目的としません</p>",
     unsafe_allow_html=True)
