@@ -283,9 +283,10 @@ def _irbank_chart(code, days=35) -> pd.DataFrame:
 
 def _yahoo_history(ticker_full, days=60) -> pd.DataFrame:
     """
-    Yahoo Finance Japan の /history ページから株価取得。
-    ticker_full は 998405.T / 998407.O / 9I31115A など完全なティッカーを受け取る。
-    失敗した場合は空DataFrameを返す。
+    Yahoo Finance Japan の /history ページから株価・基準価額を取得。
+    株式・ETF・指数: 日付 | 始値 | 高値 | 安値 | 終値 | 出来高 | 調整後終値
+    投資信託        : 日付 | 基準価額 | 前日差 | 純資産（百万）
+    日付形式        : "2026年4月15日"（日本語形式）
     """
     url = f"https://finance.yahoo.co.jp/quote/{ticker_full}/history"
     html, status = _fetch(url, referer="https://finance.yahoo.co.jp/")
@@ -293,22 +294,23 @@ def _yahoo_history(ticker_full, days=60) -> pd.DataFrame:
         return pd.DataFrame()
 
     soup = BeautifulSoup(html, "lxml")
-    page_text = (soup.find("title") or soup).get_text()
-    is_fund = any(kw in page_text for kw in ["投資信託","投信","ファンド","基準価額"])
-
-    # テーブルを探す（始値・高値・安値・終値）
-    tgt = next((t for t in soup.find_all("table")
-                if "終値" in t.get_text() and "始値" in t.get_text()), None)
+    tgt = next((t for t in soup.find_all("table") if "基準価額" in t.get_text()
+                or ("終値" in t.get_text() and "始値" in t.get_text())), None)
     if not tgt:
         return pd.DataFrame()
 
+    # 投資信託テーブルか否かをヘッダーで判定
+    headers = [th.get_text(strip=True) for th in tgt.find_all("th")]
+    is_fund = "基準価額" in headers and "始値" not in headers
+
     rows = [[td.get_text(strip=True) for td in tr.find_all(["th","td"])]
             for tr in tgt.find_all("tr")]
+
     recs = []
     for row in rows:
-        if len(row) < 4: continue
+        if len(row) < 3: continue
         c0 = row[0].strip()
-        # Yahoo Finance Japan の日付形式: "2026年6月12日" または "2026/6/12"
+        # 日付パース: "2026年4月15日" または "2026/4/15"
         dt = None
         m1 = re.match(r"(\d{4})年(\d{1,2})月(\d{1,2})日", c0)
         m2 = re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})", c0)
@@ -319,26 +321,60 @@ def _yahoo_history(ticker_full, days=60) -> pd.DataFrame:
         if dt is None: continue
 
         def g(i): return _to_float(row[i]) if len(row) > i else None
-        # 列順: 日付(0) 始値(1) 高値(2) 安値(3) 終値(4) [出来高(5)]
-        close_v = g(4)
-        recs.append({
-            "_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
-            "始値": g(1), "高値": g(2), "安値": g(3), "終値": close_v,
-            "前日比%": None, "出来高": g(5) if len(row) > 5 else None,
-            "25日乖離率": None, "PER": None, "PBR": None,
-            "基準価額": close_v if is_fund else None,
-        })
+
+        if is_fund:
+            # 列: 日付(0) 基準価額(1) 前日差(2) 純資産百万(3)
+            kijun = g(1)
+            zenjitsu_sa = g(2)   # 前日差（円）
+            recs.append({
+                "_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
+                "始値": None, "高値": None, "安値": None,
+                "終値": kijun,          # 終値として基準価額を使用
+                "前日差": zenjitsu_sa,  # 前日差（円）←計算用
+                "前日比%": None,        # 後で計算
+                "出来高": None,
+                "25日乖離率": None, "PER": None, "PBR": None,
+                "基準価額": kijun,
+                "純資産(百万)": g(3),
+            })
+        else:
+            # 列: 日付(0) 始値(1) 高値(2) 安値(3) 終値(4) 出来高(5) 調整後終値(6)
+            recs.append({
+                "_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
+                "始値": g(1), "高値": g(2), "安値": g(3), "終値": g(4),
+                "前日差": None, "前日比%": None,
+                "出来高": g(5),
+                "25日乖離率": None, "PER": None, "PBR": None,
+                "基準価額": None, "純資産(百万)": None,
+            })
 
     if not recs: return pd.DataFrame()
     df = pd.DataFrame(recs)
-    for c in PRICE_COLS[2:]: df[c] = pd.to_numeric(df.get(c), errors="coerce")
+
+    # 数値型に変換
+    num_cols = ["終値","始値","高値","安値","出来高","基準価額","前日差","純資産(百万)",
+                "25日乖離率","PER","PBR"]
+    for c in num_cols:
+        if c in df.columns: df[c] = pd.to_numeric(df.get(c), errors="coerce")
+
     df = df.sort_values("_dt").reset_index(drop=True)
-    df["前日比%"] = df["終値"].pct_change() * 100
+
+    # 前日比% を計算
+    if is_fund:
+        # 投資信託: 前日差 ÷ 前日基準価額 × 100
+        prev_kijun = df["基準価額"].shift(1)
+        df["前日比%"] = df["前日差"] / prev_kijun * 100
+    else:
+        df["前日比%"] = df["終値"].pct_change() * 100
+
+    # 25日乖離率
     ma = df["終値"].rolling(25, min_periods=1).mean()
     df["25日乖離率"] = (df["終値"] - ma) / ma * 100
+
+    # 直近 days 日分に絞る
     cutoff = datetime.today() - timedelta(days=days)
     df = df[df["_dt"] >= cutoff].reset_index(drop=True)
-    print(f"[{ticker_full}] Yahoo Finance: {len(df)}行")
+    print(f"[{ticker_full}] Yahoo Finance({'投信' if is_fund else '株式'}): {len(df)}行")
     return df
 
 def _kabutan_history(slug, days=60) -> pd.DataFrame:
