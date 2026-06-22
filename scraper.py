@@ -380,7 +380,8 @@ def _yahoo_history(ticker_full, days=60) -> pd.DataFrame:
 def _kabutan_history(slug, days=60) -> pd.DataFrame:
     """
     us.kabutan.jp から海外指数の株価を取得。
-    slug 例: %5ENDX / %5ESOX / %5EIXIC / %5EDJI
+    列順: 日付(0) 始値(1) 高値(2) 安値(3) 終値(4) 前日比円(5) 前日比%(6) 売買高(7)
+    前日比%はすでに%値（+1.95 など）なのでそのまま使用する。
     """
     url = f"https://us.kabutan.jp/indexes/{slug}/historical_prices/daily"
     html, status = _fetch(url, referer="https://us.kabutan.jp/")
@@ -388,16 +389,14 @@ def _kabutan_history(slug, days=60) -> pd.DataFrame:
 
     soup = BeautifulSoup(html, "lxml")
     recs = []
-    # kabutan は複数テーブルに分かれていることがある → 全テーブルを収集
     for tbl in soup.find_all("table"):
-        txt = tbl.get_text()
-        if "終値" not in txt and "高値" not in txt: continue
+        if "終値" not in tbl.get_text(): continue
         for tr in tbl.find_all("tr"):
             cells = [td.get_text(strip=True) for td in tr.find_all(["th","td"])]
-            if len(cells) < 4: continue
+            if len(cells) < 5: continue
             c0 = cells[0].strip()
-            # kabutan 日付形式: "26/04/24" (YY/MM/DD) または "2026/04/24"
             dt = None
+            # YY/MM/DD 形式
             m2 = re.match(r"^(\d{2})/(\d{2})/(\d{2})$", c0)
             m4 = re.match(r"^(\d{4})/(\d{2})/(\d{2})$", c0)
             if m2:
@@ -408,11 +407,12 @@ def _kabutan_history(slug, days=60) -> pd.DataFrame:
                 except: pass
             if dt is None: continue
             def g(i): return _to_float(cells[i]) if len(cells) > i else None
-            # 列順: 日付(0) 始値(1) 高値(2) 安値(3) 終値(4) 前日比%(5) 出来高(6)
             recs.append({
                 "_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
                 "始値": g(1), "高値": g(2), "安値": g(3), "終値": g(4),
-                "前日比%": g(5), "出来高": g(6),
+                # 前日比%(列6)はすでに%値。前日比円(列5)は使わない
+                "前日比%": g(6),
+                "出来高": g(7),
                 "25日乖離率": None, "PER": None, "PBR": None, "基準価額": None,
             })
 
@@ -420,6 +420,7 @@ def _kabutan_history(slug, days=60) -> pd.DataFrame:
     df = pd.DataFrame(recs)
     for c in PRICE_COLS[2:]: df[c] = pd.to_numeric(df.get(c), errors="coerce")
     df = df.sort_values("_dt").drop_duplicates("_dt").reset_index(drop=True)
+    # 25日乖離率を計算
     ma = df["終値"].rolling(25, min_periods=1).mean()
     df["25日乖離率"] = (df["終値"] - ma) / ma * 100
     cutoff = datetime.today() - timedelta(days=days)

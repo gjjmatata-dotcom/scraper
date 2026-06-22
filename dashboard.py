@@ -6,7 +6,31 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scraper import fetch_one, fetch_price_by_url, STOCKS, _safe_int_fmt
-import socket, re
+import socket, re, json
+from pathlib import Path
+
+# ── 永続化ファイルパス ────────────────────────────────
+PERSIST_FILE = Path("persist_state.json")
+
+def load_persist() -> dict:
+    """アプリ再起動後も引き継ぐ状態をファイルから読み込む"""
+    if PERSIST_FILE.exists():
+        try:
+            return json.loads(PERSIST_FILE.read_text(encoding="utf-8"))
+        except: pass
+    return {"history": {}, "watch_codes": [], "watch_names": {}}
+
+def save_persist(history: dict, watch_codes: list, watch_names: dict):
+    """状態をファイルに保存"""
+    try:
+        PERSIST_FILE.write_text(
+            json.dumps({"history": history,
+                        "watch_codes": watch_codes,
+                        "watch_names": watch_names},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8")
+    except Exception as e:
+        print(f"[永続化保存エラー] {e}")
 
 st.set_page_config(page_title="株式貸借分析", page_icon="📊", layout="wide")
 st.markdown("""
@@ -49,9 +73,16 @@ def fmt(v, dec=0, suffix=""):
         return s+suffix
     except: return "-"
 
-# ── セッション初期化 ──────────────────────────────────
-for k,v in [("watch_list",{}),("stock_data",{}),("search_history",{})]:
-    if k not in st.session_state: st.session_state[k]=v
+# ── セッション初期化（永続化ファイルから復元） ────────
+_persist = load_persist()
+for k, v in [
+    ("watch_list",     {c: {"name": _persist["watch_names"].get(c, c)}
+                        for c in _persist.get("watch_codes", [])}),
+    ("stock_data",     {}),
+    ("search_history", _persist.get("history", {})),
+]:
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # ── サイドバー ────────────────────────────────────────
 try: ip=socket.gethostbyname(socket.gethostname())
@@ -80,14 +111,21 @@ def _normalize(code):
     return c.zfill(4) if re.fullmatch(r"\d{1,4}",c) else c
 
 def _do_fetch(code):
-    info=fetch_one(code)
-    name=info["name"] or code
-    st.session_state.stock_data[code]=info
+    info = fetch_one(code)
+    name = info["name"] or code
+    st.session_state.stock_data[code] = info
     # 検索履歴（最大10件・最新先頭）
-    h=st.session_state.search_history
-    h.pop(code,None)
-    st.session_state.search_history=dict(list({code:name,**h}.items())[:10])
-    return info,name
+    h = st.session_state.search_history
+    h.pop(code, None)
+    st.session_state.search_history = dict(list({code: name, **h}.items())[:10])
+    # 永続化保存
+    wl = st.session_state.watch_list
+    save_persist(
+        st.session_state.search_history,
+        list(wl.keys()),
+        {c: wl[c].get("name", c) for c in wl}
+    )
+    return info, name
 
 if (add_btn or only_btn) and inp:
     code=_normalize(inp)
