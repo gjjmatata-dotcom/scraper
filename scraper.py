@@ -1,18 +1,20 @@
 """
-scraper.py  ─ 完全版 v2
-・貸借: taisyaku.jp(直近7日) + irbank.net/nisshokin(過去分)
-・信用残: irbank.net/margin
-・株価: irbank.net/chart → Yahoo Finance Japan → kabutan.jp(US/海外指数)
-・IRバンク404の場合は①②をスキップして株価取得のみ実施
-・長期株価: stocks.db（Playwright取得済みキャッシュ）+ Yahoo Finance JWT API
+scraper.py  v3
+変更点:
+  - 機関異常判定: ①出来高×1.5超かつ前日比±1.5%以上 ②前日比±4%以上かつ出来高×1.2超
+  - _fetch_yf_api_history: 種別判定を正式版に統一（投資信託/日本指数/日本株/米国株）
+  - load_from_db: DBにあれば DB優先、なければ YF API でその都度取得（保存なし）
+  - save_to_db: 新規取得データをDBに追記保存
+  - コード整理: _get_yf_jwt 削除（requests では取れないため）、重複排除
 """
-import re, time, requests, sqlite3, json
+import re, time, requests, sqlite3, json, os
 from bs4 import BeautifulSoup
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# ── 設定 ────────────────────────────────────────────
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
@@ -26,24 +28,18 @@ STOCKS = {
     "9984": {"name": "SBG"},
 }
 
-# stocks.db のパス（同ディレクトリ or 環境変数で上書き可）
-import os
 DB_PATH = Path(os.environ.get("STOCKS_DB_PATH", "stocks.db"))
-
-# Yahoo Finance Japan のティッカー候補サフィックス（試行順）
-YF_SUFFIXES = ["", ".T", ".O", ".OS", ".N"]
-
-TODAY = datetime.now().strftime("%Y%m%d")
+TODAY   = datetime.now().strftime("%Y%m%d")
 
 # ── ユーティリティ ───────────────────────────────────
 def _safe_int_fmt(v) -> str:
     try:
         f = float(v)
-        return "-" if f!=f or abs(f)==float("inf") else f"{int(round(f)):,}"
+        return "-" if f != f or abs(f) == float("inf") else f"{int(round(f)):,}"
     except: return "-"
 
 def _to_float(txt):
-    s = re.sub(r"[\s,\u3000%倍兆億万円]","",str(txt))
+    s = re.sub(r"[\s,\u3000%倍兆億万円]", "", str(txt))
     s = s.replace("▲","-").replace("－","-").replace("＊＊＊＊＊","").strip()
     if s in ("","-","―","*****","−"): return None
     try: return float(s)
@@ -55,7 +51,7 @@ def _parse_yaku(txt):
     m = re.search(r"[\d.]+", s.replace(",",""))
     return float(m.group()) if m else None
 
-def _fetch(url, referer="https://irbank.net/") -> tuple[str, int]:
+def _fetch(url, referer="https://irbank.net/") -> tuple:
     h = {**HEADERS, "Referer": referer}
     for _ in range(2):
         try:
@@ -72,7 +68,7 @@ def _get_rows(html, keywords):
     soup = BeautifulSoup(html, "lxml")
     for tbl in soup.find_all("table"):
         if all(kw in tbl.get_text() for kw in keywords):
-            return [[td.get_text(" ",strip=True) for td in tr.find_all(["th","td"])]
+            return [[td.get_text(" ", strip=True) for td in tr.find_all(["th","td"])]
                     for tr in tbl.find_all("tr")]
     return []
 
@@ -80,62 +76,102 @@ def _parse_irbank_rows(rows, min_cols, mapper):
     records=[]; year=datetime.today().year
     for row in rows:
         if not row: continue
-        c0=row[0].strip()
-        if re.fullmatch(r"\d{4}",c0): year=int(c0); continue
-        m=re.search(r"(\d{1,2})/(\d{2})",c0)
-        if not m or len(row)<min_cols: continue
-        try: dt=datetime(year,int(m.group(1)),int(m.group(2)))
+        c0 = row[0].strip()
+        if re.fullmatch(r"\d{4}", c0): year=int(c0); continue
+        m = re.search(r"(\d{1,2})/(\d{2})", c0)
+        if not m or len(row) < min_cols: continue
+        try: dt = datetime(year, int(m.group(1)), int(m.group(2)))
         except: continue
-        rec=mapper(row,dt)
+        rec = mapper(row, dt)
         if rec: records.append(rec)
     return records
 
 def _bal_chg(txt):
-    p=txt.strip().split()
+    p = txt.strip().split()
     return _to_float(p[0]) if p else None, _to_float(p[1]) if len(p)>1 else None
 
 def _two(txt):
-    p=txt.strip().split()
+    p = txt.strip().split()
     return _to_float(p[0]) if p else None, _to_float(p[1]) if len(p)>1 else None
 
 def _irbank_exists(code) -> bool:
     _, status = _fetch(f"https://irbank.net/{code}")
     return status == 200
 
+# ── 銘柄種別判定（一元化） ───────────────────────────
+def _code_type(code: str) -> str:
+    """
+    戻り値: "fund" | "index_jp" | "stock_jp" | "stock_us"
+    判定ルール:
+      投資信託  : 英数字ちょうど8桁（ドットなし）
+      日本指数  : 998xxx.T / 998xxx.O
+      日本株    : 数字+任意英字.T
+      米国株/指数: それ以外
+    """
+    if re.fullmatch(r"[A-Z0-9]{8}", code):   return "fund"
+    if re.match(r"998\d+\.(T|O)$", code):    return "index_jp"
+    if re.match(r"\d+[A-Z]*\.T$", code):     return "stock_jp"
+    return "stock_us"
+
+def _yf_urls(code: str, size: int = 2400) -> list:
+    """種別に応じた bff API URL リスト（優先順）"""
+    t = _code_type(code)
+    if t == "fund":
+        return [
+            f"https://finance.yahoo.co.jp/bff-pc/v1/main/fund/chart/history/{code}"
+            f"?fromDate=&size={size}&timeFrame=daily&toDate={TODAY}"
+        ]
+    if t == "index_jp":
+        return [
+            f"https://finance.yahoo.co.jp/bff-chart/ex/v1/common/price/history"
+            f"?code={code}&fromDate=&fxTimeFrame=&size={size}&timeFrame=daily&toDate={TODAY}"
+        ]
+    if t == "stock_jp":
+        return [
+            f"https://finance.yahoo.co.jp/bff-quote-stocks/v1/ajax/chart/ex/v1/common/price/history"
+            f"?code={code}&fromDate=&fxTimeFrame=&size={size}&timeFrame=daily&toDate={TODAY}",
+            f"https://finance.yahoo.co.jp/bff-chart/ex/v1/common/price/history"
+            f"?code={code}&fromDate=&fxTimeFrame=&size={size}&timeFrame=daily&toDate={TODAY}",
+        ]
+    # stock_us
+    return [
+        f"https://finance.yahoo.co.jp/bff-quote-stocks/v1/ajax/chart/ex/v1/common/price/history"
+        f"?code={code}&fromDate=&fxTimeFrame=&size={size}&timeFrame=daily&toDate={TODAY}",
+        f"https://finance.yahoo.co.jp/bff-chart/ex/v1/common/price/history"
+        f"?code={code}&fromDate=&fxTimeFrame=&size={size}&timeFrame=daily&toDate={TODAY}",
+    ]
 
 # ════════════════════════════════════════
 # taisyaku.jp 直近7営業日
 # ════════════════════════════════════════
 def _fetch_taisyaku(code) -> pd.DataFrame:
-    html, status = _fetch(
-        f"https://www.taisyaku.jp/app/stock/detail/{code}-01",
-        referer="https://www.taisyaku.jp/")
+    html, _ = _fetch(f"https://www.taisyaku.jp/app/stock/detail/{code}-01",
+                     referer="https://www.taisyaku.jp/")
     if not html: return pd.DataFrame()
-
-    soup = BeautifulSoup(html,"lxml")
-    tgt = next((t for t in soup.find_all("table")
-                if "融資" in t.get_text() and "差引残高" in t.get_text()), None)
+    soup = BeautifulSoup(html, "lxml")
+    tgt  = next((t for t in soup.find_all("table")
+                 if "融資" in t.get_text() and "差引残高" in t.get_text()), None)
     if not tgt: return pd.DataFrame()
 
     rows = tgt.find_all("tr")
-    mc = max(sum(int(c.get("colspan",1)) for c in r.find_all(["th","td"])) for r in rows)+2
-    R  = len(rows)
-    grid=[[""]*mc for _ in range(R)]; occ=[[False]*mc for _ in range(R)]
-    for ri,row in enumerate(rows):
-        ci=0
+    mc   = max(sum(int(c.get("colspan",1)) for c in r.find_all(["th","td"])) for r in rows)+2
+    R    = len(rows)
+    grid = [[""]*mc for _ in range(R)]; occ = [[False]*mc for _ in range(R)]
+    for ri, row in enumerate(rows):
+        ci = 0
         for cell in row.find_all(["th","td"]):
-            while ci<mc and occ[ri][ci]: ci+=1
-            if ci>=mc: break
-            rs=int(cell.get("rowspan",1)); cs=int(cell.get("colspan",1))
-            txt=cell.get_text(strip=True)
+            while ci < mc and occ[ri][ci]: ci += 1
+            if ci >= mc: break
+            rs = int(cell.get("rowspan",1)); cs = int(cell.get("colspan",1))
+            txt = cell.get_text(strip=True)
             for dr in range(rs):
                 for dc in range(cs):
                     r2,c2=ri+dr,ci+dc
                     if r2<R and c2<mc: grid[r2][c2]=txt; occ[r2][c2]=True
-            ci+=cs
+            ci += cs
 
     date_ri=None; dates=[]; dc0=None
-    for ri,row in enumerate(grid):
+    for ri, row in enumerate(grid):
         fd,fc=[],[]
         for ci,cell in enumerate(row):
             if len(cell)==10 and cell[4]=="/" and cell[7]=="/":
@@ -159,29 +195,28 @@ def _fetch_taisyaku(code) -> pd.DataFrame:
 
     yn=fr("融資","新規","新規"); yr=fr("融資","返済","返済"); yb=fr("融資","残高","残高")
     kn=fr("貸株","新規","新規"); kr=fr("貸株","返済","返済"); kb=fr("貸株","残高","残高")
-    sh=fr("差引残高"); yaku_row=fr("最高料率")
-
+    yaku_row=fr("最高料率")
     recs=[]
     for i,d in enumerate(dates):
         dt=datetime.strptime(d,"%Y/%m/%d")
         k=kb[i]; y=yb[i]
-        ratio = round(y/k,2) if (y and k and k>0) else (float("inf") if (y and not k) else float("nan"))
+        ratio=round(y/k,2) if (y and k and k>0) else (float("inf") if (y and not k) else float("nan"))
         recs.append({"_dt":dt,"申込日":dt.strftime("%Y/%m/%d"),
                      "買い残高":yb[i],"買い増減":None,"買い新規":yn[i],"買い返済":yr[i],
                      "売り残高":kb[i],"売り増減":None,"売り新規":kn[i],"売り返済":kr[i],
                      "貸借倍率":ratio,"逆日歩":yaku_row[i] if yaku_row else None})
-
     df=pd.DataFrame(recs)
     for c in ["買い残高","買い新規","買い返済","売り残高","売り新規","売り返済","貸借倍率","逆日歩"]:
         if c in df.columns: df[c]=pd.to_numeric(df[c],errors="coerce")
     return df.sort_values("_dt").reset_index(drop=True)
 
-
 # ════════════════════════════════════════
-# IRバンク nisshokin（過去分）
+# IRバンク nisshokin / margin
 # ════════════════════════════════════════
 LEND_COLS=["_dt","申込日","買い残高","買い増減","買い新規","買い返済",
            "売り残高","売り増減","売り新規","売り返済","貸借倍率","逆日歩"]
+MARGIN_COLS=["_dt","日付","買い残高","買い増減","売り残高","売り増減",
+             "信用倍率","逆日歩","買い残増減率","売り残増減率"]
 
 def _fetch_irbank_lending(code) -> pd.DataFrame:
     html,_=_fetch(f"https://irbank.net/{code}/nisshokin")
@@ -203,15 +238,11 @@ def _fetch_irbank_lending(code) -> pd.DataFrame:
     for c in LEND_COLS[2:]: df[c]=pd.to_numeric(df.get(c),errors="coerce")
     return df.sort_values("_dt").reset_index(drop=True)
 
-
-# ════════════════════════════════════════
-# 貸借データ統合
-# ════════════════════════════════════════
 def fetch_lending(code) -> pd.DataFrame:
     df_r=_fetch_taisyaku(code); time.sleep(1)
     df_i=_fetch_irbank_lending(code)
     if df_r.empty and df_i.empty: return pd.DataFrame(columns=LEND_COLS)
-    if df_r.empty: df=df_i
+    if df_r.empty:  df=df_i
     elif df_i.empty: df=df_r
     else:
         rd=set(df_r["申込日"])
@@ -222,20 +253,12 @@ def fetch_lending(code) -> pd.DataFrame:
     print(f"[{code}] 貸借: {len(df)}行")
     return df
 
-
-# ════════════════════════════════════════
-# IRバンク margin（週次信用残）
-# ════════════════════════════════════════
-MARGIN_COLS=["_dt","日付","買い残高","買い増減","売り残高","売り増減",
-             "信用倍率","逆日歩","買い残増減率","売り残増減率"]
-
 def fetch_margin(code) -> pd.DataFrame:
     html,_=_fetch(f"https://irbank.net/{code}/margin")
     rows=_get_rows(html,["買い残高","売り残高","倍率"])
     if not rows: return pd.DataFrame(columns=MARGIN_COLS)
     def mapper(row,dt):
         bb,bc=_bal_chg(row[1]) if len(row)>1 else (None,None)
-        _,_  =_two(row[2])     if len(row)>2 else (None,None)
         sb,sc=_bal_chg(row[3]) if len(row)>3 else (None,None)
         return {"_dt":dt,"日付":dt.strftime("%Y/%m/%d"),
                 "買い残高":bb,"買い増減":bc,"売り残高":sb,"売り増減":sc,
@@ -252,269 +275,182 @@ def fetch_margin(code) -> pd.DataFrame:
     print(f"[{code}] 信用残: {len(df)}件")
     return df
 
-
 # ════════════════════════════════════════
-# stocks.db 長期株価キャッシュ
+# stocks.db 操作
 # ════════════════════════════════════════
 def _db_table_for(code: str) -> str | None:
-    """銘柄コードに対応する stocks.db テーブル名を返す"""
-    if not DB_PATH.exists():
-        return None
+    """DBに存在するテーブル名を返す。なければ None"""
+    if not DB_PATH.exists(): return None
     safe = re.sub(r"[^A-Za-z0-9]", "_", code)
-    candidates = [
-        f"price_{safe}",
-        f"price_{safe.lstrip('_')}",
-        f"price_{code.replace('.','_').replace('^','').replace('%','')}",
-    ]
     try:
         conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
+        cur  = conn.cursor()
         cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = {r[0] for r in cur.fetchall()}
         conn.close()
-        for c in candidates:
-            if c in tables:
-                return c
-        # 部分マッチ（末尾サフィックスを除いたコード）
+        # 完全一致候補
+        for c in [f"price_{safe}", f"price_{code.replace('.','_').replace('^','').replace('%','')}"]:
+            if c in tables: return c
+        # 部分マッチ（例: ^IXIC → price__IXIC / price_5EIXIC）
         base = re.sub(r"\.(T|O|N|OS)$", "", safe, flags=re.I)
         for t in tables:
-            if base.lower() in t.lower():
-                return t
+            if base.lower() in t.lower(): return t
     except Exception as e:
         print(f"[DB検索エラー] {e}")
     return None
 
-def load_from_db(code: str) -> pd.DataFrame:
-    """
-    stocks.db から長期株価を読み込み、PRICE_COLS 形式に変換して返す。
-    テーブルが存在しない場合は空 DataFrame を返す。
-    """
-    tbl = _db_table_for(code)
-    if not tbl:
-        return pd.DataFrame()
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql(f"SELECT * FROM [{tbl}] ORDER BY date", conn)
-        conn.close()
-    except Exception as e:
-        print(f"[DB読込エラー] {tbl}: {e}")
-        return pd.DataFrame()
-
-    if df.empty:
-        return pd.DataFrame()
-
-    # date 列を datetime に統一
+def _normalize_price_df(df: pd.DataFrame) -> pd.DataFrame:
+    """rawカラムを統一した日本語カラムに変換"""
     df["_dt"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
     df = df.sort_values("_dt").reset_index(drop=True)
-
-    # 列名マッピング
-    col_map = {
-        "openPrice":  "始値",
-        "highPrice":  "高値",
-        "lowPrice":   "安値",
-        "closePrice": "終値",
-        "volume":     "出来高",
-    }
-    for src, dst in col_map.items():
-        if src in df.columns:
-            df[dst] = pd.to_numeric(df[src], errors="coerce")
-
-    # 投資信託の場合 netAssetsBalance → 純資産(百万)
+    col_map = {"openPrice":"始値","highPrice":"高値","lowPrice":"安値",
+               "closePrice":"終値","volume":"出来高"}
+    for src,dst in col_map.items():
+        if src in df.columns: df[dst]=pd.to_numeric(df[src],errors="coerce")
     if "netAssetsBalance" in df.columns:
-        df["純資産(百万)"] = pd.to_numeric(df["netAssetsBalance"], errors="coerce") / 100
-    if "returnRate" in df.columns:
-        pass  # 基準価額は終値に入っている
-
-    df["日付"] = df["_dt"].dt.strftime("%Y/%m/%d")
-    df["前日比%"] = df["終値"].pct_change() * 100
-    ma25 = df["終値"].rolling(25, min_periods=1).mean()
-    df["25日乖離率"] = (df["終値"] - ma25) / ma25 * 100
+        df["純資産(百万)"]=pd.to_numeric(df["netAssetsBalance"],errors="coerce")/100
+    df["日付"]     = df["_dt"].dt.strftime("%Y/%m/%d")
+    df["前日比%"]  = df["終値"].pct_change()*100
+    ma25           = df["終値"].rolling(25,min_periods=1).mean()
+    df["25日乖離率"]=(df["終値"]-ma25)/ma25*100
     for c in ["PER","PBR","基準価額"]:
-        if c not in df.columns:
-            df[c] = None
-
-    print(f"[DB] {code} ({tbl}): {len(df)}行 {df['_dt'].min().date()}~{df['_dt'].max().date()}")
+        if c not in df.columns: df[c]=None
     return df
 
-
-# ════════════════════════════════════════
-# Yahoo Finance JWT API 長期株価取得
-# （Playwright不要・requests のみ・JWT自動取得）
-# ════════════════════════════════════════
-def _get_yf_jwt(code_for_page: str) -> tuple[str, dict]:
-    """
-    Yahoo Finance Japanのチャートページに requests でアクセスし、
-    レスポンスヘッダー/メタタグからJWTらしきトークンを探す。
-    ※ブラウザなしでは取れないケースが多いため、取れなければ空文字を返す。
-    """
-    url = f"https://finance.yahoo.co.jp/quote/{code_for_page}/chart"
+def load_from_db(code: str) -> pd.DataFrame:
+    tbl = _db_table_for(code)
+    if not tbl: return pd.DataFrame()
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        # JWT はページ内の __NEXT_DATA__ JSON に埋め込まれていることがある
-        m = re.search(r'"jwtToken"\s*:\s*"([^"]+)"', r.text)
-        if m:
-            return m.group(1), {}
-    except Exception:
-        pass
-    return "", {}
+        conn = sqlite3.connect(DB_PATH)
+        df   = pd.read_sql(f"SELECT * FROM [{tbl}] ORDER BY date", conn)
+        conn.close()
+    except Exception as e:
+        print(f"[DB読込エラー] {tbl}: {e}"); return pd.DataFrame()
+    if df.empty: return pd.DataFrame()
+    df = _normalize_price_df(df)
+    print(f"[DB] {code}({tbl}): {len(df)}行 {df['_dt'].min().date()}~{df['_dt'].max().date()}")
+    return df
 
+def save_to_db(code: str, df: pd.DataFrame):
+    """
+    新規取得した株価データを stocks.db に追記保存。
+    既存データとの重複は date で除外。
+    """
+    if df.empty or "_dt" not in df.columns: return
+    table_name = "price_" + re.sub(r"[^A-Za-z0-9]","_",code)
+    # 保存カラム
+    save_cols = {
+        "date":       df["_dt"].dt.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
+        "openPrice":  df.get("始値"),
+        "highPrice":  df.get("高値"),
+        "lowPrice":   df.get("安値"),
+        "closePrice": df.get("終値"),
+        "volume":     df.get("出来高"),
+        "code":       code,
+    }
+    df_save = pd.DataFrame({k:v for k,v in save_cols.items() if v is not None})
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        # 既存日付を取得して重複排除
+        try:
+            existing = pd.read_sql(f"SELECT date FROM [{table_name}]", conn)
+            exist_dates = set(existing["date"].tolist())
+            df_save = df_save[~df_save["date"].isin(exist_dates)]
+        except: pass  # テーブルなければそのまま
+        if not df_save.empty:
+            df_save.to_sql(table_name, conn, if_exists="append", index=False)
+            print(f"[DB保存] {table_name}: {len(df_save)}行追記")
+        conn.close()
+    except Exception as e:
+        print(f"[DB保存エラー] {table_name}: {e}")
+
+# ════════════════════════════════════════
+# Yahoo Finance bff API 長期株価取得
+# ════════════════════════════════════════
 def _fetch_yf_api_history(code: str, size: int = 2400) -> pd.DataFrame:
     """
-    Yahoo Finance Japan の bff API から長期株価を取得する。
-    コード種別を自動判定してエンドポイントを選択。
-    JWT が取れなくてもCookieだけで通るエンドポイントを優先する。
+    bff API から長期株価を requests のみで取得。
+    種別判定は _code_type / _yf_urls に一元化。
+    JWTなし（Cookie認証のみ）で通るエンドポイントを種別に応じて選択。
     """
-    import re as _re
-
-    def _is_fund(c):
-        return bool(_re.fullmatch(r"[A-Z0-9]{8}", c))
-
-    def _is_index_jp(c):
-        return bool(_re.match(r"998\d+\.(T|O)$", c))
-
-    def _is_stock_jp(c):
-        return bool(_re.match(r"\d+[A-Z]*\.T$", c))
-
-    urls = []
-    if _is_fund(code):
-        urls = [
-            f"https://finance.yahoo.co.jp/bff-pc/v1/main/fund/chart/history/{code}"
-            f"?fromDate=&size={size}&timeFrame=daily&toDate={TODAY}"
-        ]
-    elif _is_index_jp(code):
-        urls = [
-            f"https://finance.yahoo.co.jp/bff-chart/ex/v1/common/price/history"
-            f"?code={code}&fromDate=&fxTimeFrame=&size={size}&timeFrame=daily&toDate={TODAY}"
-        ]
-    elif _is_stock_jp(code):
-        urls = [
-            f"https://finance.yahoo.co.jp/bff-quote-stocks/v1/ajax/chart/ex/v1/common/price/history"
-            f"?code={code}&fromDate=&fxTimeFrame=&size={size}&timeFrame=daily&toDate={TODAY}",
-            f"https://finance.yahoo.co.jp/bff-chart/ex/v1/common/price/history"
-            f"?code={code}&fromDate=&fxTimeFrame=&size={size}&timeFrame=daily&toDate={TODAY}",
-        ]
-    else:
-        urls = [
-            f"https://finance.yahoo.co.jp/bff-chart/ex/v1/common/price/history"
-            f"?code={code}&fromDate=&fxTimeFrame=&size={size}&timeFrame=daily&toDate={TODAY}",
-            f"https://finance.yahoo.co.jp/bff-quote-stocks/v1/ajax/chart/ex/v1/common/price/history"
-            f"?code={code}&fromDate=&fxTimeFrame=&size={size}&timeFrame=daily&toDate={TODAY}",
-        ]
-
     session = requests.Session()
-    # まずチャートページにアクセスしてCookieを取得
     try:
-        session.get(
-            f"https://finance.yahoo.co.jp/quote/{code}/chart",
-            headers=HEADERS, timeout=15
-        )
-    except Exception:
-        pass
+        session.get(f"https://finance.yahoo.co.jp/quote/{code}/chart",
+                    headers=HEADERS, timeout=15)
+    except: pass
 
-    for url in urls:
+    for url in _yf_urls(code, size):
         try:
             r = session.get(url, headers={**HEADERS,
                 "Referer": f"https://finance.yahoo.co.jp/quote/{code}/chart"}, timeout=20)
-            if r.status_code != 200:
-                continue
+            if r.status_code != 200: continue
             data = r.json()
             rows = data.get("priceHistories") or data.get("prices") or data.get("histories")
-            if not rows:
-                continue
+            if not rows: continue
 
             df = pd.DataFrame(rows)
-            # 日付列統一
-            for dcol in ("baseDate", "baseDatetime"):
-                if dcol in df.columns:
-                    df.rename(columns={dcol: "date"}, inplace=True)
-                    break
-
-            df["_dt"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-            df = df.sort_values("_dt").reset_index(drop=True)
-
-            col_map = {
-                "openPrice":  "始値",
-                "highPrice":  "高値",
-                "lowPrice":   "安値",
-                "closePrice": "終値",
-                "volume":     "出来高",
-            }
-            for src, dst in col_map.items():
-                if src in df.columns:
-                    df[dst] = pd.to_numeric(df[src], errors="coerce")
-
-            df["日付"] = df["_dt"].dt.strftime("%Y/%m/%d")
-            df["前日比%"] = df["終値"].pct_change() * 100
-            ma25 = df["終値"].rolling(25, min_periods=1).mean()
-            df["25日乖離率"] = (df["終値"] - ma25) / ma25 * 100
-            for c in ["PER","PBR","基準価額"]:
-                if c not in df.columns:
-                    df[c] = None
-
-            print(f"[YF API] {code}: {len(df)}行 取得成功")
+            for dcol in ("baseDate","baseDatetime"):
+                if dcol in df.columns: df.rename(columns={dcol:"date"},inplace=True); break
+            df = _normalize_price_df(df)
+            print(f"[YF API] {code}: {len(df)}行 ({_code_type(code)})")
             return df
-
         except Exception as e:
-            print(f"[YF API] {url}: {e}")
-            continue
-
+            print(f"[YF API] {url}: {e}"); continue
     return pd.DataFrame()
 
+# ════════════════════════════════════════
+# 株価フラグ付与
+# ════════════════════════════════════════
+PRICE_COLS=["_dt","日付","始値","高値","安値","終値","前日比%",
+            "出来高","25日乖離率","PER","PBR","基準価額"]
+
+def _add_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    機関異常フラグ:
+      ① 出来高×1.5超 かつ 前日比±1.5%以上
+      ② 前日比±4%以上 かつ 出来高×1.2超
+    """
+    vm  = df["出来高"].fillna(0).mean()
+    vol = df["出来高"].fillna(0)
+    ret = df["前日比%"].abs().fillna(0)
+    df["出来高平均"] = vm
+    df["日中幅"]    = (df.get("高値", df["終値"]) - df.get("安値", df["終値"])).fillna(0)
+    df["機関異常"]  = ((vol > vm*1.5) & (ret >= 1.5)) | ((ret >= 4.0) & (vol > vm*1.2))
+    df["出来高異常"]= vol > vm*2
+    return df
 
 # ════════════════════════════════════════
 # 長期株価取得（DB優先 → YF API → スクレイピング）
 # ════════════════════════════════════════
 def fetch_price_long(code: str, days: int = 0) -> pd.DataFrame:
     """
-    長期株価を返す。
     1. stocks.db にキャッシュがあればそれを使う
-    2. なければ Yahoo Finance JWT API で自動取得
-    3. それも失敗したら通常スクレイピング（fetch_price）
-    days=0 のとき全期間返す。days>0 のとき直近 days 日に絞る。
+    2. なければ YF API で取得してDBに保存
+    3. それも失敗したら通常スクレイピング
+    days=0: 全期間 / days>0: 直近N日
     """
-    # 1. DB キャッシュ
     df = load_from_db(code)
 
-    # 2. YF API（DBになければ、またはDBが古ければ）
     if df.empty:
-        print(f"[{code}] DB未登録 → YF API で取得")
+        print(f"[{code}] DB未登録 → YF API 取得")
         df = _fetch_yf_api_history(code, size=2400)
+        if not df.empty:
+            save_to_db(code, df)  # 取得できたらDBに保存
 
-    # 3. 通常スクレイピング（YF API も失敗したとき）
     if df.empty:
         print(f"[{code}] YF API失敗 → 通常スクレイピング")
         df = fetch_price(code, days=max(days, 365))
 
-    if df.empty:
-        return df
-
-    # フラグ付与
+    if df.empty: return df
     df = _add_flags(df)
-
-    # 期間絞り込み
     if days > 0:
         cutoff = datetime.today() - timedelta(days=days)
         df = df[df["_dt"] >= cutoff].reset_index(drop=True)
-
     return df.sort_values("_dt", ascending=False).reset_index(drop=True)
 
-
 # ════════════════════════════════════════
-# 株価取得（IRバンク → Yahoo Finance Japan → kabutan.jp）
+# 短期株価取得（IRバンク → Yahoo Finance → kabutan）
 # ════════════════════════════════════════
-PRICE_COLS=["_dt","日付","始値","高値","安値","終値","前日比%",
-            "出来高","25日乖離率","PER","PBR","基準価額"]
-
-def _add_flags(df) -> pd.DataFrame:
-    vm=df["出来高"].fillna(0).mean()
-    df["出来高平均"]=vm
-    df["日中幅"]=(df["高値"]-df["安値"]).fillna(0)
-    rm=df["日中幅"].rolling(5,min_periods=1).mean().shift(1).fillna(df["日中幅"].mean())
-    vol=df["出来高"].fillna(0); ret=df["前日比%"].abs().fillna(0)
-    df["機関異常"]=((vol>vm*2)&(ret>=1.5))|((ret>=4)&(vol>vm*1.5))|(df["日中幅"]>rm*2)
-    df["出来高異常"]=vol>vm*2
-    return df
-
 def _irbank_chart(code, days=35) -> pd.DataFrame:
     html,_=_fetch(f"https://irbank.net/{code}/chart")
     rows=_get_rows(html,["始値","終値","25日乖離"])
@@ -534,278 +470,204 @@ def _irbank_chart(code, days=35) -> pd.DataFrame:
     return df[df["_dt"]>=cutoff].reset_index(drop=True)
 
 def _yahoo_history(ticker_full, days=60) -> pd.DataFrame:
-    url = f"https://finance.yahoo.co.jp/quote/{ticker_full}/history"
-    html, status = _fetch(url, referer="https://finance.yahoo.co.jp/")
-    if not html or status != 200:
-        return pd.DataFrame()
-
-    soup = BeautifulSoup(html, "lxml")
-    tgt = next((t for t in soup.find_all("table") if "基準価額" in t.get_text()
-                or ("終値" in t.get_text() and "始値" in t.get_text())), None)
-    if not tgt:
-        return pd.DataFrame()
-
-    headers = [th.get_text(strip=True) for th in tgt.find_all("th")]
-    is_fund = "基準価額" in headers and "始値" not in headers
-
-    rows = [[td.get_text(strip=True) for td in tr.find_all(["th","td"])]
-            for tr in tgt.find_all("tr")]
-
-    recs = []
+    html,status=_fetch(f"https://finance.yahoo.co.jp/quote/{ticker_full}/history",
+                       referer="https://finance.yahoo.co.jp/")
+    if not html or status!=200: return pd.DataFrame()
+    soup=BeautifulSoup(html,"lxml")
+    tgt=next((t for t in soup.find_all("table") if "基準価額" in t.get_text()
+              or ("終値" in t.get_text() and "始値" in t.get_text())),None)
+    if not tgt: return pd.DataFrame()
+    headers=[th.get_text(strip=True) for th in tgt.find_all("th")]
+    is_fund="基準価額" in headers and "始値" not in headers
+    rows=[[td.get_text(strip=True) for td in tr.find_all(["th","td"])]
+          for tr in tgt.find_all("tr")]
+    recs=[]
     for row in rows:
-        if len(row) < 3: continue
-        c0 = row[0].strip()
-        dt = None
-        m1 = re.match(r"(\d{4})年(\d{1,2})月(\d{1,2})日", c0)
-        m2 = re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})", c0)
-        m = m1 or m2
+        if len(row)<3: continue
+        c0=row[0].strip(); dt=None
+        m=re.match(r"(\d{4})年(\d{1,2})月(\d{1,2})日",c0) or re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})",c0)
         if m:
-            try: dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            try: dt=datetime(int(m.group(1)),int(m.group(2)),int(m.group(3)))
             except: continue
         if dt is None: continue
-
-        def g(i): return _to_float(row[i]) if len(row) > i else None
-
+        def g(i): return _to_float(row[i]) if len(row)>i else None
         if is_fund:
-            kijun = g(1); zenjitsu_sa = g(2)
-            recs.append({
-                "_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
-                "始値": None, "高値": None, "安値": None,
-                "終値": kijun, "前日差": zenjitsu_sa, "前日比%": None,
-                "出来高": None, "25日乖離率": None, "PER": None, "PBR": None,
-                "基準価額": kijun, "純資産(百万)": g(3),
-            })
+            recs.append({"_dt":dt,"日付":dt.strftime("%Y/%m/%d"),"始値":None,"高値":None,"安値":None,
+                         "終値":g(1),"前日差":g(2),"前日比%":None,"出来高":None,
+                         "25日乖離率":None,"PER":None,"PBR":None,"基準価額":g(1),"純資産(百万)":g(3)})
         else:
-            recs.append({
-                "_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
-                "始値": g(1), "高値": g(2), "安値": g(3), "終値": g(4),
-                "前日差": None, "前日比%": None, "出来高": g(5),
-                "25日乖離率": None, "PER": None, "PBR": None,
-                "基準価額": None, "純資産(百万)": None,
-            })
-
+            recs.append({"_dt":dt,"日付":dt.strftime("%Y/%m/%d"),
+                         "始値":g(1),"高値":g(2),"安値":g(3),"終値":g(4),
+                         "前日差":None,"前日比%":None,"出来高":g(5),
+                         "25日乖離率":None,"PER":None,"PBR":None,"基準価額":None})
     if not recs: return pd.DataFrame()
-    df = pd.DataFrame(recs)
-
-    num_cols = ["終値","始値","高値","安値","出来高","基準価額","前日差","純資産(百万)",
-                "25日乖離率","PER","PBR"]
-    for c in num_cols:
-        if c in df.columns: df[c] = pd.to_numeric(df.get(c), errors="coerce")
-
-    df = df.sort_values("_dt").reset_index(drop=True)
-
+    df=pd.DataFrame(recs)
+    for c in ["終値","始値","高値","安値","出来高","基準価額","前日差","純資産(百万)"]:
+        if c in df.columns: df[c]=pd.to_numeric(df.get(c),errors="coerce")
+    df=df.sort_values("_dt").reset_index(drop=True)
     if is_fund:
-        prev_kijun = df["基準価額"].shift(1)
-        df["前日比%"] = df["前日差"] / prev_kijun * 100
+        prev=df["基準価額"].shift(1)
+        df["前日比%"]=df["前日差"]/prev*100
     else:
-        df["前日比%"] = df["終値"].pct_change() * 100
-
-    ma = df["終値"].rolling(25, min_periods=1).mean()
-    df["25日乖離率"] = (df["終値"] - ma) / ma * 100
-
-    cutoff = datetime.today() - timedelta(days=days)
-    df = df[df["_dt"] >= cutoff].reset_index(drop=True)
-    print(f"[{ticker_full}] Yahoo Finance({'投信' if is_fund else '株式'}): {len(df)}行")
-    return df
+        df["前日比%"]=df["終値"].pct_change()*100
+    ma=df["終値"].rolling(25,min_periods=1).mean()
+    df["25日乖離率"]=(df["終値"]-ma)/ma*100
+    cutoff=datetime.today()-timedelta(days=days)
+    return df[df["_dt"]>=cutoff].reset_index(drop=True)
 
 def _kabutan_history(slug, days=60) -> pd.DataFrame:
-    url = f"https://us.kabutan.jp/indexes/{slug}/historical_prices/daily"
-    html, status = _fetch(url, referer="https://us.kabutan.jp/")
-    if not html or status != 200: return pd.DataFrame()
-
-    soup = BeautifulSoup(html, "lxml")
-    recs = []
+    html,status=_fetch(f"https://us.kabutan.jp/indexes/{slug}/historical_prices/daily",
+                       referer="https://us.kabutan.jp/")
+    if not html or status!=200: return pd.DataFrame()
+    soup=BeautifulSoup(html,"lxml"); recs=[]
     for tbl in soup.find_all("table"):
         if "終値" not in tbl.get_text(): continue
         for tr in tbl.find_all("tr"):
-            cells = [td.get_text(strip=True) for td in tr.find_all(["th","td"])]
-            if len(cells) < 5: continue
-            c0 = cells[0].strip()
-            dt = None
-            m2 = re.match(r"^(\d{2})/(\d{2})/(\d{2})$", c0)
-            m4 = re.match(r"^(\d{4})/(\d{2})/(\d{2})$", c0)
+            cells=[td.get_text(strip=True) for td in tr.find_all(["th","td"])]
+            if len(cells)<5: continue
+            c0=cells[0].strip(); dt=None
+            m2=re.match(r"^(\d{2})/(\d{2})/(\d{2})$",c0)
+            m4=re.match(r"^(\d{4})/(\d{2})/(\d{2})$",c0)
             if m2:
-                try: dt = datetime(2000+int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
+                try: dt=datetime(2000+int(m2.group(1)),int(m2.group(2)),int(m2.group(3)))
                 except: pass
             elif m4:
-                try: dt = datetime(int(m4.group(1)), int(m4.group(2)), int(m4.group(3)))
+                try: dt=datetime(int(m4.group(1)),int(m4.group(2)),int(m4.group(3)))
                 except: pass
             if dt is None: continue
-            def g(i): return _to_float(cells[i]) if len(cells) > i else None
-            recs.append({
-                "_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
-                "始値": g(1), "高値": g(2), "安値": g(3), "終値": g(4),
-                "前日比%": g(6), "出来高": g(7),
-                "25日乖離率": None, "PER": None, "PBR": None, "基準価額": None,
-            })
-
+            def g(i): return _to_float(cells[i]) if len(cells)>i else None
+            recs.append({"_dt":dt,"日付":dt.strftime("%Y/%m/%d"),
+                         "始値":g(1),"高値":g(2),"安値":g(3),"終値":g(4),
+                         "前日比%":g(6),"出来高":g(7),
+                         "25日乖離率":None,"PER":None,"PBR":None,"基準価額":None})
     if not recs: return pd.DataFrame()
-    df = pd.DataFrame(recs)
-    for c in PRICE_COLS[2:]: df[c] = pd.to_numeric(df.get(c), errors="coerce")
-    df = df.sort_values("_dt").drop_duplicates("_dt").reset_index(drop=True)
-    ma = df["終値"].rolling(25, min_periods=1).mean()
-    df["25日乖離率"] = (df["終値"] - ma) / ma * 100
-    cutoff = datetime.today() - timedelta(days=days)
-    df = df[df["_dt"] >= cutoff].reset_index(drop=True)
-    print(f"[kabutan {slug}] {len(df)}行")
-    return df
-
-
-def fetch_price_by_url(url: str, name: str = "", days: int = 0) -> pd.DataFrame:
-    """
-    URLから直接データ取得。
-    days=0 のとき全期間、days>0 のとき直近 days 日に絞る。
-    """
-    effective_days = days if days > 0 else 9999
-    if "us.kabutan.jp" in url:
-        m = re.search(r"/indexes/([^/]+)/", url)
-        slug = m.group(1) if m else ""
-        df = _kabutan_history(slug, effective_days)
-    elif "finance.yahoo.co.jp" in url:
-        m = re.search(r"/quote/([^/]+)/", url)
-        ticker = m.group(1) if m else ""
-        # まず DB / YF API 長期を試みる
-        df = fetch_price_long(ticker, days=days)
-        if df.empty:
-            df = _yahoo_history(ticker, effective_days)
-    else:
-        df = pd.DataFrame()
-    if not df.empty:
-        if "出来高平均" not in df.columns:
-            df = _add_flags(df)
-        return df.sort_values("_dt", ascending=False).reset_index(drop=True)
-    return pd.DataFrame(columns=PRICE_COLS + ["出来高平均","機関異常","出来高異常"])
-
+    df=pd.DataFrame(recs)
+    for c in PRICE_COLS[2:]: df[c]=pd.to_numeric(df.get(c),errors="coerce")
+    df=df.sort_values("_dt").drop_duplicates("_dt").reset_index(drop=True)
+    ma=df["終値"].rolling(25,min_periods=1).mean()
+    df["25日乖離率"]=(df["終値"]-ma)/ma*100
+    cutoff=datetime.today()-timedelta(days=days)
+    return df[df["_dt"]>=cutoff].reset_index(drop=True)
 
 def fetch_price(code, days=35) -> pd.DataFrame:
-    """直近データのみ取得（既存動作を維持）"""
-    df = _irbank_chart(code, days)
+    df=_irbank_chart(code,days)
     if not df.empty:
-        return _add_flags(df).sort_values("_dt", ascending=False).reset_index(drop=True)
-
+        return _add_flags(df).sort_values("_dt",ascending=False).reset_index(drop=True)
     print(f"[{code}] IRバンクchart失敗 → Yahoo Finance")
-
-    base = code.upper()
-    if re.fullmatch(r"\d{6}", base):
-        suffixes = [".T", ".O", ".N", ".L", ""]
-    elif re.fullmatch(r"\d{4}", base):
-        suffixes = [".T", ""]
-    else:
-        suffixes = ["", ".T"]
-
+    base=code.upper()
+    suffixes=[".T",""] if re.fullmatch(r"\d{4}",base) else \
+             [".T",".O",".N",".L",""] if re.fullmatch(r"\d{6}",base) else ["",".T"]
     for sfx in suffixes:
-        ticker = f"{base}{sfx}"
-        df = _yahoo_history(ticker, days)
+        df=_yahoo_history(f"{base}{sfx}",days)
         if not df.empty:
-            return _add_flags(df).sort_values("_dt", ascending=False).reset_index(drop=True)
-
+            return _add_flags(df).sort_values("_dt",ascending=False).reset_index(drop=True)
     print(f"[{code}] Yahoo Finance失敗 → kabutan.jp")
-
-    kabutan_map = {
-        "NDX": "%5ENDX", "SOX": "%5ESOX", "IXIC": "%5EIXIC",
-        "DJI": "%5EDJI", "GSPC": "%5EGSPC", "SPX": "%5EGSPC",
-    }
-    slug = kabutan_map.get(base.lstrip("^"))
+    kabutan_map={"NDX":"%5ENDX","SOX":"%5ESOX","IXIC":"%5EIXIC","DJI":"%5EDJI","GSPC":"%5EGSPC"}
+    slug=kabutan_map.get(base.lstrip("^"))
     if slug:
-        df = _kabutan_history(slug, days)
+        df=_kabutan_history(slug,days)
         if not df.empty:
-            return _add_flags(df).sort_values("_dt", ascending=False).reset_index(drop=True)
+            return _add_flags(df).sort_values("_dt",ascending=False).reset_index(drop=True)
+    return pd.DataFrame(columns=PRICE_COLS+["出来高平均","機関異常","出来高異常"])
 
-    return pd.DataFrame(columns=PRICE_COLS + ["出来高平均","機関異常","出来高異常"])
-
+def fetch_price_by_url(url: str, name: str="", days: int=0) -> pd.DataFrame:
+    eff=days if days>0 else 9999
+    if "us.kabutan.jp" in url:
+        m=re.search(r"/indexes/([^/]+)/",url)
+        df=_kabutan_history(m.group(1) if m else "",eff)
+    elif "finance.yahoo.co.jp" in url:
+        m=re.search(r"/quote/([^/]+)/",url)
+        ticker=m.group(1) if m else ""
+        df=fetch_price_long(ticker,days=days)
+        if df.empty: df=_yahoo_history(ticker,eff)
+    else:
+        df=pd.DataFrame()
+    if not df.empty:
+        if "出来高平均" not in df.columns: df=_add_flags(df)
+        return df.sort_values("_dt",ascending=False).reset_index(drop=True)
+    return pd.DataFrame(columns=PRICE_COLS+["出来高平均","機関異常","出来高異常"])
 
 # ════════════════════════════════════════
 # テクニカル指標計算
 # ════════════════════════════════════════
 def calc_technicals(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    価格 DataFrame にテクニカル指標を追加して返す。
-    入力は _dt でソート済み（昇順）であること。
-    """
-    if df.empty or "終値" not in df.columns:
-        return df
+    """昇順ソート済みの DataFrame にテクニカル指標を追加して返す"""
+    if df.empty or "終値" not in df.columns: return df
+    df=df.sort_values("_dt").reset_index(drop=True)
+    c=df["終値"].astype(float)
+    h=df.get("高値",c).astype(float)
+    l=df.get("安値",c).astype(float)
 
-    df = df.sort_values("_dt").reset_index(drop=True)
-    c = df["終値"].astype(float)
-    h = df.get("高値", c).astype(float)
-    l = df.get("安値", c).astype(float)
+    # 移動平均
+    df["MA5"]  =c.rolling(5,  min_periods=1).mean().round(2)
+    df["MA25"] =c.rolling(25, min_periods=1).mean().round(2)
+    df["MA75"] =c.rolling(75, min_periods=1).mean().round(2)
+    df["MA200"]=c.rolling(200,min_periods=1).mean().round(2)
 
-    # ── 移動平均 ──
-    df["MA5"]   = c.rolling(5,   min_periods=1).mean().round(2)
-    df["MA25"]  = c.rolling(25,  min_periods=1).mean().round(2)
-    df["MA75"]  = c.rolling(75,  min_periods=1).mean().round(2)
-    df["MA200"] = c.rolling(200, min_periods=1).mean().round(2)
+    # ボリンジャーバンド
+    std25=c.rolling(25,min_periods=1).std()
+    df["BB_upper"]=(df["MA25"]+2*std25).round(2)
+    df["BB_lower"]=(df["MA25"]-2*std25).round(2)
+    df["BB_%B"]   =((c-df["BB_lower"])/(df["BB_upper"]-df["BB_lower"])).round(3)
 
-    # ── ボリンジャーバンド（25日 ±2σ） ──
-    std25 = c.rolling(25, min_periods=1).std()
-    df["BB_upper"] = (df["MA25"] + 2*std25).round(2)
-    df["BB_lower"] = (df["MA25"] - 2*std25).round(2)
-    df["BB_%B"]    = ((c - df["BB_lower"]) / (df["BB_upper"] - df["BB_lower"])).round(3)
-
-    # ── パラボリック SAR ──
-    n = len(df); af0, af_step, af_max = 0.02, 0.02, 0.2
-    sar = [0.0]*n; ep = [0.0]*n; af = [af0]*n; bull = [True]*n
-    sar[0] = l.iloc[0]; ep[0] = h.iloc[0]
-    for i in range(1, n):
-        s = sar[i-1] + af[i-1]*(ep[i-1] - sar[i-1])
-        if bull[i-1]:
-            s = min(s, l.iloc[i-1], l.iloc[i-2] if i>=2 else l.iloc[i-1])
-            if l.iloc[i] < s:
-                bull[i]=False; sar[i]=ep[i-1]; ep[i]=l.iloc[i]; af[i]=af0
+    # パラボリック SAR
+    n=len(df); af0,step,mx=0.02,0.02,0.2
+    sar=[0.]*n; ep=[0.]*n; af=[af0]*n; bl=[True]*n
+    sar[0]=l.iloc[0]; ep[0]=h.iloc[0]
+    for i in range(1,n):
+        s=sar[i-1]+af[i-1]*(ep[i-1]-sar[i-1])
+        if bl[i-1]:
+            s=min(s,l.iloc[i-1],l.iloc[i-2] if i>=2 else l.iloc[i-1])
+            if l.iloc[i]<s:
+                bl[i]=False;sar[i]=ep[i-1];ep[i]=l.iloc[i];af[i]=af0
             else:
-                bull[i]=True; sar[i]=s
-                if h.iloc[i] > ep[i-1]: ep[i]=h.iloc[i]; af[i]=min(af[i-1]+af_step, af_max)
-                else: ep[i]=ep[i-1]; af[i]=af[i-1]
+                bl[i]=True;sar[i]=s
+                if h.iloc[i]>ep[i-1]: ep[i]=h.iloc[i];af[i]=min(af[i-1]+step,mx)
+                else: ep[i]=ep[i-1];af[i]=af[i-1]
         else:
-            s = max(s, h.iloc[i-1], h.iloc[i-2] if i>=2 else h.iloc[i-1])
-            if h.iloc[i] > s:
-                bull[i]=True; sar[i]=ep[i-1]; ep[i]=h.iloc[i]; af[i]=af0
+            s=max(s,h.iloc[i-1],h.iloc[i-2] if i>=2 else h.iloc[i-1])
+            if h.iloc[i]>s:
+                bl[i]=True;sar[i]=ep[i-1];ep[i]=h.iloc[i];af[i]=af0
             else:
-                bull[i]=False; sar[i]=s
-                if l.iloc[i] < ep[i-1]: ep[i]=l.iloc[i]; af[i]=min(af[i-1]+af_step, af_max)
-                else: ep[i]=ep[i-1]; af[i]=af[i-1]
-    df["SAR"]      = pd.Series(sar).round(2)
-    df["SAR_bull"] = bull
+                bl[i]=False;sar[i]=s
+                if l.iloc[i]<ep[i-1]: ep[i]=l.iloc[i];af[i]=min(af[i-1]+step,mx)
+                else: ep[i]=ep[i-1];af[i]=af[i-1]
+    df["SAR"]     =pd.Series(sar).round(2)
+    df["SAR_bull"]=bl
 
-    # ── RSI (14日) ──
-    delta = c.diff()
-    gain  = delta.clip(lower=0).rolling(14, min_periods=1).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14, min_periods=1).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    df["RSI"] = (100 - 100/(1+rs)).round(2)
+    # RSI
+    d=c.diff(); gain=d.clip(lower=0).rolling(14,min_periods=1).mean()
+    loss=(-d.clip(upper=0)).rolling(14,min_periods=1).mean()
+    df["RSI"]=(100-100/(1+gain/loss.replace(0,np.nan))).round(2)
 
-    # ── ストキャスティクス ──
-    low14  = l.rolling(14, min_periods=1).min()
-    high14 = h.rolling(14, min_periods=1).max()
-    k_raw  = 100*(c - low14) / (high14 - low14)
-    df["FastK"] = k_raw.round(2)
-    df["FastD"] = k_raw.rolling(3, min_periods=1).mean().round(2)
-    df["SlowK"] = df["FastD"]
-    df["SlowD"] = df["SlowK"].rolling(3, min_periods=1).mean().round(2)
+    # ストキャスティクス
+    low14=l.rolling(14,min_periods=1).min(); high14=h.rolling(14,min_periods=1).max()
+    kr=100*(c-low14)/(high14-low14)
+    df["FastK"]=kr.round(2)
+    df["FastD"]=kr.rolling(3,min_periods=1).mean().round(2)
+    df["SlowK"]=df["FastD"]
+    df["SlowD"]=df["SlowK"].rolling(3,min_periods=1).mean().round(2)
 
-    # ── MACD ──
-    ema12 = c.ewm(span=12, adjust=False).mean()
-    ema26 = c.ewm(span=26, adjust=False).mean()
-    df["MACD"]        = (ema12 - ema26).round(2)
-    df["MACD_signal"] = df["MACD"].ewm(span=9, adjust=False).mean().round(2)
-    df["MACD_hist"]   = (df["MACD"] - df["MACD_signal"]).round(2)
+    # MACD
+    ema12=c.ewm(span=12,adjust=False).mean(); ema26=c.ewm(span=26,adjust=False).mean()
+    df["MACD"]       =(ema12-ema26).round(2)
+    df["MACD_signal"]=df["MACD"].ewm(span=9,adjust=False).mean().round(2)
+    df["MACD_hist"]  =(df["MACD"]-df["MACD_signal"]).round(2)
 
-    # ── DMI / ADX ──
-    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    pdm = (h - h.shift()).clip(lower=0)
-    ndm = (l.shift() - l).clip(lower=0)
-    atr14 = tr.rolling(14, min_periods=1).mean()
-    df["DI_plus"]  = (100 * pdm.rolling(14, min_periods=1).mean() / atr14).round(2)
-    df["DI_minus"] = (100 * ndm.rolling(14, min_periods=1).mean() / atr14).round(2)
-    dx = (df["DI_plus"]-df["DI_minus"]).abs() / (df["DI_plus"]+df["DI_minus"]) * 100
-    df["ADX"] = dx.rolling(14, min_periods=1).mean().round(2)
+    # DMI / ADX
+    tr=pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    pdm=(h-h.shift()).clip(lower=0); ndm=(l.shift()-l).clip(lower=0)
+    atr14=tr.rolling(14,min_periods=1).mean()
+    df["DI_plus"] =(100*pdm.rolling(14,min_periods=1).mean()/atr14).round(2)
+    df["DI_minus"]=(100*ndm.rolling(14,min_periods=1).mean()/atr14).round(2)
+    dx=(df["DI_plus"]-df["DI_minus"]).abs()/(df["DI_plus"]+df["DI_minus"])*100
+    df["ADX"]=dx.rolling(14,min_periods=1).mean().round(2)
 
-    # ── モメンタム / ROC ──
-    df["Momentum"] = (c - c.shift(10)).round(2)
-    df["ROC"]      = ((c - c.shift(10)) / c.shift(10) * 100).round(3)
+    # モメンタム / ROC
+    df["Momentum"]=(c-c.shift(10)).round(2)
+    df["ROC"]=((c-c.shift(10))/c.shift(10)*100).round(3)
 
     return df
-
 
 # ════════════════════════════════════════
 # 銘柄名取得
@@ -813,8 +675,7 @@ def calc_technicals(df: pd.DataFrame) -> pd.DataFrame:
 def resolve_name(code) -> str:
     html,status=_fetch(f"https://irbank.net/{code}")
     if status==200 and html:
-        soup=BeautifulSoup(html,"lxml")
-        t=soup.find("title")
+        soup=BeautifulSoup(html,"lxml"); t=soup.find("title")
         if t:
             s=t.get_text(strip=True).replace("|","").replace("IRバンク","").replace(code,"")
             s=re.sub(r"\s+"," ",s).strip()
@@ -823,13 +684,11 @@ def resolve_name(code) -> str:
         html,status=_fetch(f"https://finance.yahoo.co.jp/quote/{code}{sfx}",
                            referer="https://finance.yahoo.co.jp/")
         if status==200 and html:
-            soup=BeautifulSoup(html,"lxml")
-            t=soup.find("title")
+            soup=BeautifulSoup(html,"lxml"); t=soup.find("title")
             if t:
                 s=t.get_text(strip=True).split("|")[0].strip()
                 if s and s!=code: return s
     return code
-
 
 # ════════════════════════════════════════
 # 買い/売り圧力判定
@@ -846,27 +705,21 @@ def judge_pressure(lending, price) -> dict:
     if pc>0 and lr<1: return {"label":"🔵 安値買い戻し","detail":"株価上昇＋売り残多（買い戻し）","color":"#388bfd"}
     return {"label":"⚪ 中立","detail":"方向性なし","color":"#8b949e"}
 
-
 # ════════════════════════════════════════
 # 単一銘柄取得
 # ════════════════════════════════════════
 def fetch_one(code) -> dict:
-    name = STOCKS.get(code,{}).get("name") or resolve_name(code) or code
+    name=STOCKS.get(code,{}).get("name") or resolve_name(code) or code
     print(f"\n{'='*40}\n{code} {name}")
-
-    exists = _irbank_exists(code)
+    exists=_irbank_exists(code)
     if exists:
         l=fetch_lending(code); time.sleep(1)
         m=fetch_margin(code);  time.sleep(1)
     else:
-        print(f"[{code}] IRバンク未対応 → 貸借・信用残をスキップ")
+        print(f"[{code}] IRバンク未対応 → 貸借・信用残スキップ")
         l=pd.DataFrame(columns=LEND_COLS)
         m=pd.DataFrame(columns=MARGIN_COLS)
-
-    # 短期データ（既存フロー）
     p=fetch_price(code); time.sleep(1)
-    # 長期データ（DB + YF API）
-    p_long = fetch_price_long(code, days=0)
-
+    p_long=fetch_price_long(code,days=0)
     return {"name":name,"lending":l,"price":p,"price_long":p_long,
             "margin":m,"pressure":judge_pressure(l,p)}
