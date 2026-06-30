@@ -524,16 +524,18 @@ def _irbank_chart(code, days=35) -> pd.DataFrame:
     def mapper(row, dt):
         def g(i): return _to_float(row[i]) if len(row) > i else None
         return {"_dt":dt, "始値":g(1), "高値":g(2), "安値":g(3), "終値":g(4),
-                "前日比%":g(5), "出来高":g(6), "25日乖離率":g(8),
-                "PER":g(9), "PBR":g(10), "基準価額":None}
+                "出来高":g(6), "PER":g(9), "PBR":g(10), "基準価額":None}
     recs = _parse_irbank_rows(rows, 9, mapper)
     if not recs: return pd.DataFrame()
     df = pd.DataFrame(recs)
-    for c in ["始値","高値","安値","終値","前日比%","出来高","25日乖離率","PER","PBR"]:
+    for c in ["始値","高値","安値","終値","出来高","PER","PBR"]:
         if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.sort_values("_dt").reset_index(drop=True)
     cutoff = datetime.today() - timedelta(days=days)
-    return df[df["_dt"] >= cutoff].reset_index(drop=True)
+    df = df[df["_dt"] >= cutoff].reset_index(drop=True)
+    if df.empty: return df
+    # 日付・前日比%・25日乖離率を共通処理で必ず生成（dashboard側のKeyError防止）
+    return _finalize_price_df(df)
 
 def fetch_price(code, days=35) -> pd.DataFrame:
     """短期データ（貸借チャート用）。IRバンク → Yahoo → kabutan の順"""
