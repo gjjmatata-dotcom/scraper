@@ -327,9 +327,13 @@ def _fetch_yfinance(ticker: str, period: str = "max") -> pd.DataFrame:
         # MultiIndex の場合はフラット化
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = [c[0] for c in raw.columns]
+        # reset_index前のインデックス名を保持（Date/Datetime以外の場合に備える）
+        idx_name = raw.index.name or "Date"
         raw = raw.reset_index()
-        # Date 列を _dt に
-        date_col = "Date" if "Date" in raw.columns else "Datetime"
+        # 日付列を特定（インデックス由来の列名、またはDate/Datetime）
+        date_col = idx_name if idx_name in raw.columns else (
+            "Date" if "Date" in raw.columns else (
+            "Datetime" if "Datetime" in raw.columns else raw.columns[0]))
         raw["_dt"] = pd.to_datetime(raw[date_col]).dt.tz_localize(None)
         df = pd.DataFrame()
         df["_dt"]  = raw["_dt"]
@@ -351,56 +355,104 @@ def _fetch_yfinance(ticker: str, period: str = "max") -> pd.DataFrame:
 # ════════════════════════════════════════
 # Yahoo Finance Japan スクレイピング（投資信託・指数 フォールバック）
 # ════════════════════════════════════════
-def _yahoo_scrape_history(ticker_full: str, pages: int = 10) -> pd.DataFrame:
-    """
-    Yahoo Finance Japan の履歴ページを複数ページスクレイピング。
-    投資信託・日本指数など yfinance で取れない銘柄用。
-    pages: 取得するページ数（1ページ≒20日、10ページ≒200日）
-    """
-    all_recs = []
-    base_url = f"https://finance.yahoo.co.jp/quote/{ticker_full}/history"
+def _parse_history_table(html: str):
+    """履歴テーブル1ページ分をパースして (is_fund, records) を返す"""
+    soup = BeautifulSoup(html, "lxml")
+    tgt = next((t for t in soup.find_all("table")
+                if "基準価額" in t.get_text()
+                or ("終値" in t.get_text() and "始値" in t.get_text())), None)
+    if not tgt:
+        return None, []
+    headers = [th.get_text(strip=True) for th in tgt.find_all("th")]
+    is_fund = "基準価額" in headers and "始値" not in headers
+    recs = []
+    for tr in tgt.find_all("tr"):
+        cells = [td.get_text(strip=True) for td in tr.find_all(["th","td"])]
+        if len(cells) < 3: continue
+        c0 = cells[0].strip(); dt = None
+        m = (re.match(r"(\d{4})年(\d{1,2})月(\d{1,2})日", c0)
+             or re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})", c0))
+        if m:
+            try: dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except: continue
+        if dt is None: continue
+        def g(i): return _to_float(cells[i]) if len(cells) > i else None
+        if is_fund:
+            recs.append({"_dt": dt, "始値": None, "高値": None, "安値": None,
+                        "終値": g(1), "前日差": g(2), "出来高": None,
+                        "基準価額": g(1), "純資産(百万)": g(3)})
+        else:
+            recs.append({"_dt": dt, "始値": g(1), "高値": g(2), "安値": g(3),
+                        "終値": g(4), "前日差": None, "出来高": g(5),
+                        "基準価額": None})
+    return is_fund, recs
 
-    for page in range(1, pages + 1):
-        url = base_url if page == 1 else f"{base_url}?page={page}"
-        html, status = _fetch(url, referer="https://finance.yahoo.co.jp/")
-        if not html or status != 200:
+def _yahoo_scrape_history(ticker_full: str, years: int = 10, styl_stock: bool = None) -> pd.DataFrame:
+    """
+    Yahoo Finance Japan の履歴ページを from/to 範囲指定でスクレイピングし、
+    1年ごとに区切って遡りながら全期間を結合する。
+
+    URL形式:
+      個別株/ETF : .../history?styl=stock&from=YYYYMMDD&to=YYYYMMDD&timeFrame=d&page=N
+      日本指数   : .../history?from=YYYYMMDD&to=YYYYMMDD&timeFrame=d&page=N (styl=stockなし)
+      投資信託   : .../history?styl=stock&from=...&to=...&timeFrame=d&page=N
+                   ただし from/to が効かない場合は ?page=N のみのレガシー形式にフォールバック
+
+    styl_stock: True→styl=stock付与 / False→付与しない / None→自動判定(_code_typeから)
+    """
+    if styl_stock is None:
+        ct = _code_type(ticker_full)
+        styl_stock = ct in ("stock_jp", "fund")  # 指数(index_jp)はstyl=stockなし
+
+    base_url = f"https://finance.yahoo.co.jp/quote/{ticker_full}/history"
+    today = datetime.today()
+    all_recs = []
+    is_fund_flag = None
+    legacy_used = False
+
+    for y in range(years):
+        to_dt   = today - timedelta(days=365*y)
+        from_dt = to_dt - timedelta(days=365)
+        to_s    = to_dt.strftime("%Y%m%d")
+        from_s  = from_dt.strftime("%Y%m%d")
+
+        year_recs = []
+        for page in range(1, 11):  # 1年最大10ページ(約250営業日)あれば十分
+            params = f"from={from_s}&to={to_s}&timeFrame=d&page={page}"
+            if styl_stock: params = "styl=stock&" + params
+            url = f"{base_url}?{params}"
+            html, status = _fetch(url, referer="https://finance.yahoo.co.jp/")
+            if not html or status != 200:
+                break
+            is_fund, recs = _parse_history_table(html)
+            if is_fund is None or not recs:
+                break
+            is_fund_flag = is_fund
+            year_recs.extend(recs)
+            time.sleep(0.4)
+            if len(recs) < 20:  # ページ末尾（1ページ20件未満なら終端）
+                break
+
+        if not year_recs:
+            # from/to が効かない銘柄（投資信託の一部）はレガシー ?page=N 形式にフォールバック
+            if y == 0 and not all_recs:
+                legacy_used = True
+                for page in range(1, 21):
+                    url = base_url if page == 1 else f"{base_url}?page={page}"
+                    html, status = _fetch(url, referer="https://finance.yahoo.co.jp/")
+                    if not html or status != 200: break
+                    is_fund, recs = _parse_history_table(html)
+                    if is_fund is None or not recs: break
+                    is_fund_flag = is_fund
+                    all_recs.extend(recs)
+                    time.sleep(0.4)
+                    if len(recs) < 20: break
+            break  # year_recsが空＝それ以前のデータなし→打ち切り
+
+        all_recs.extend(year_recs)
+        # 直近年で取得件数が極端に少ない(上場間もない等)場合はそこで終了
+        if len(year_recs) < 5 and y > 0:
             break
-        soup = BeautifulSoup(html, "lxml")
-        tgt = next((t for t in soup.find_all("table")
-                    if "基準価額" in t.get_text()
-                    or ("終値" in t.get_text() and "始値" in t.get_text())), None)
-        if not tgt:
-            break
-        headers = [th.get_text(strip=True) for th in tgt.find_all("th")]
-        is_fund = "基準価額" in headers and "始値" not in headers
-        page_recs = []
-        for tr in tgt.find_all("tr"):
-            cells = [td.get_text(strip=True) for td in tr.find_all(["th","td"])]
-            if len(cells) < 3: continue
-            c0 = cells[0].strip(); dt = None
-            m = (re.match(r"(\d{4})年(\d{1,2})月(\d{1,2})日", c0)
-                 or re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})", c0))
-            if m:
-                try: dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-                except: continue
-            if dt is None: continue
-            def g(i): return _to_float(cells[i]) if len(cells) > i else None
-            if is_fund:
-                page_recs.append({
-                    "_dt": dt, "始値": None, "高値": None, "安値": None,
-                    "終値": g(1), "前日差": g(2), "出来高": None,
-                    "基準価額": g(1), "純資産(百万)": g(3),
-                })
-            else:
-                page_recs.append({
-                    "_dt": dt, "始値": g(1), "高値": g(2), "安値": g(3),
-                    "終値": g(4), "前日差": None, "出来高": g(5),
-                    "基準価額": None,
-                })
-        if not page_recs:
-            break
-        all_recs.extend(page_recs)
-        time.sleep(0.5)
 
     if not all_recs:
         return pd.DataFrame()
@@ -415,7 +467,6 @@ def _yahoo_scrape_history(ticker_full: str, pages: int = 10) -> pd.DataFrame:
         prev = df["基準価額"].shift(1)
         df["前日比%_calc"] = df["前日差"] / prev * 100
     df = _finalize_price_df(df)
-    # 投資信託の前日比%を上書き
     if "前日比%_calc" in df.columns:
         mask = df["前日比%_calc"].notna()
         df.loc[mask, "前日比%"] = df.loc[mask, "前日比%_calc"]
@@ -490,12 +541,9 @@ def fetch_price_long(code: str, days: int = 0) -> pd.DataFrame:
         df = _fetch_yfinance(ticker, period="max")
         if not df.empty: break
 
-    # 2. Yahoo Finance スクレイピング（投資信託・日本指数など）
+    # 2. Yahoo Finance スクレイピング（投資信託・日本指数・yfinance失敗銘柄すべて対象）
     if df.empty:
-        ct = _code_type(code)
-        if ct in ("fund", "index_jp"):
-            # 20ページ ≒ 約400日分
-            df = _yahoo_scrape_history(code, pages=20)
+        df = _yahoo_scrape_history(code, years=10)
 
     # 3. kabutan（米国指数フォールバック）
     if df.empty:
@@ -549,7 +597,7 @@ def fetch_price(code, days=35) -> pd.DataFrame:
                 else [".T",".O",".N",".L",""] if re.fullmatch(r"\d{6}", base)
                 else ["",".T"])
     for sfx in suffixes:
-        df = _yahoo_scrape_history(f"{base}{sfx}", pages=3)
+        df = _yahoo_scrape_history(f"{base}{sfx}", years=1)
         if not df.empty:
             return _add_flags(df).sort_values("_dt", ascending=False).reset_index(drop=True)
 
@@ -572,7 +620,7 @@ def fetch_price_by_url(url: str, name: str = "", days: int = 0) -> pd.DataFrame:
         ticker = m.group(1) if m else ""
         df = fetch_price_long(ticker, days=days)
         if df.empty:
-            df = _yahoo_scrape_history(ticker, pages=20)
+            df = _yahoo_scrape_history(ticker, years=10)
     else:
         df = pd.DataFrame()
     if not df.empty:
