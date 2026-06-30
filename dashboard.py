@@ -15,8 +15,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scraper import (fetch_one, fetch_price_by_url, fetch_price_long,
-                     calc_technicals, save_to_db, STOCKS, _safe_int_fmt,
-                     _normalize_price_df, DB_PATH)
+                     calc_technicals, STOCKS, _safe_int_fmt)
 import socket, re, json
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -96,50 +95,12 @@ st.sidebar.markdown("### 📱 LAN内アクセス")
 st.sidebar.code(f"http://{ip}:8501")
 st.sidebar.caption("`--server.address 0.0.0.0` で起動")
 
-# DB銘柄追加（ファイルアップロード方式）
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 🗄️ stocks.db に銘柄追加")
+st.sidebar.markdown("### ℹ️ 長期データについて")
 st.sidebar.caption(
-    "Playwrightスクレイパーで取得した stocks.db をここにアップロードすると、"
-    "新しいテーブルを既存DBにマージ保存します。")
-uploaded_db = st.sidebar.file_uploader("stocks.db をアップロード", type=["db"],
-                                        key="db_upload")
-if uploaded_db and st.sidebar.button("📥 DBにマージ", key="db_merge_btn"):
-    import sqlite3, tempfile, shutil
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-        tmp.write(uploaded_db.read()); tmp_path=Path(tmp.name)
-    try:
-        src_conn = sqlite3.connect(tmp_path)
-        src_cur  = src_conn.cursor()
-        src_cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        src_tables = [r[0] for r in src_cur.fetchall()]
-
-        dst_conn = sqlite3.connect(DB_PATH)
-        dst_cur  = dst_conn.cursor()
-        dst_cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        dst_tables = {r[0] for r in dst_cur.fetchall()}
-
-        merged=0; skipped=0
-        for tbl in src_tables:
-            df_src = pd.read_sql(f"SELECT * FROM [{tbl}]", src_conn)
-            if tbl in dst_tables:
-                # 重複排除してAPPEND
-                df_dst = pd.read_sql(f"SELECT date FROM [{tbl}]", dst_conn)
-                exist  = set(df_dst["date"].tolist())
-                df_new = df_src[~df_src["date"].isin(exist)]
-                if not df_new.empty:
-                    df_new.to_sql(tbl, dst_conn, if_exists="append", index=False)
-                    merged += len(df_new)
-                else: skipped+=1
-            else:
-                df_src.to_sql(tbl, dst_conn, if_exists="replace", index=False)
-                merged += len(df_src)
-        dst_conn.commit(); dst_conn.close(); src_conn.close()
-        st.sidebar.success(f"✅ {merged}行追加 / {skipped}テーブルスキップ（重複なし）")
-    except Exception as e:
-        st.sidebar.error(f"❌ マージエラー: {e}")
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    "株価は yfinance（日本株・米国株・指数）と "
+    "Yahoo Finance スクレイピング（投資信託）で自動取得します。"
+    "DB・Playwrightは不要です。")
 
 st.markdown(
     "<h2 style='text-align:center;color:#f0f6fc;font-size:20px;margin:4px 0'>"
