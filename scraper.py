@@ -1,14 +1,17 @@
 """
-scraper.py v4
+scraper.py v5
 長期株価: yfinance で取得（JWT/DB/Playwright不要・環境非依存）
-投資信託(9I31115A等): yfinanceでは取れないため Yahoo Finance スクレイピングにフォールバック
+投資信託(9I31115A等): yfinance/Yahoo長期スクレイピングどちらも不可なため、
+                      毎回の短期データ取得結果を price_history_cache.json に
+                      日付キーで蓄積し、時間経過とともに自前で長期データを構築する。
 出来高なし銘柄(投資信託・一部指数)でも _add_flags がクラッシュしないよう修正
 """
-import re, time, requests
+import re, time, requests, json, os
 from bs4 import BeautifulSoup
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from pathlib import Path
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
@@ -22,6 +25,79 @@ STOCKS = {
     "6758": {"name": "ソニーG"},
     "9984": {"name": "SBG"},
 }
+
+# ════════════════════════════════════════
+# JSON蓄積キャッシュ（長期スクレイピングが効かない銘柄用）
+# ════════════════════════════════════════
+CACHE_FILE = Path(os.environ.get("PRICE_CACHE_PATH", "price_history_cache.json"))
+
+# 保存する列のみに絞る（軽量化のため最小限）
+_CACHE_COLS = ["始値","高値","安値","終値","出来高","基準価額","純資産(百万)","PER","PBR"]
+
+def _load_cache() -> dict:
+    """price_history_cache.json 全体を読み込む。{code: {date: {col:val,...}}} 形式。"""
+    if not CACHE_FILE.exists():
+        return {}
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[キャッシュ読込エラー] {e}")
+        return {}
+
+def _save_cache(cache: dict):
+    """全体を書き戻す。書き込みは銘柄追加時のみなので頻度は低く軽量。"""
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, separators=(",", ":"))
+    except Exception as e:
+        print(f"[キャッシュ保存エラー] {e}")
+
+def cache_append(code: str, df: pd.DataFrame):
+    """
+    取得した df（_dt列必須）の行をキャッシュに追記する。
+    既存日付は上書き（最新値で更新）、新規日付は追加。
+    呼び出しごとに全体load/saveするが、JSONは小さいため動作への影響は軽微。
+    """
+    if df.empty or "_dt" not in df.columns:
+        return
+    cache = _load_cache()
+    bucket = cache.setdefault(code, {})
+    added = 0
+    for _, row in df.iterrows():
+        date_key = row["_dt"].strftime("%Y-%m-%d")
+        is_new = date_key not in bucket
+        entry = {}
+        for c in _CACHE_COLS:
+            if c in df.columns:
+                v = row.get(c)
+                entry[c] = None if pd.isna(v) else float(v)
+        bucket[date_key] = entry
+        if is_new: added += 1
+    if added > 0:
+        _save_cache(cache)
+        print(f"[キャッシュ追記] {code}: 新規{added}件 / 累計{len(bucket)}件")
+
+def cache_load_df(code: str) -> pd.DataFrame:
+    """キャッシュから指定銘柄の全期間データをDataFrameで返す。無ければ空。"""
+    cache = _load_cache()
+    bucket = cache.get(code, {})
+    if not bucket:
+        return pd.DataFrame()
+    recs = []
+    for date_key, entry in bucket.items():
+        try:
+            dt = datetime.strptime(date_key, "%Y-%m-%d")
+        except Exception:
+            continue
+        rec = {"_dt": dt}
+        rec.update(entry)
+        recs.append(rec)
+    if not recs:
+        return pd.DataFrame()
+    df = pd.DataFrame(recs).sort_values("_dt").reset_index(drop=True)
+    return _finalize_price_df(df)
+
 
 # ── 銘柄種別判定・正規化 ─────────────────────────────
 def _normalize_jp_code(code: str) -> str:
@@ -427,7 +503,7 @@ def _yahoo_scrape_history(ticker_full: str, years: int = 10, styl_stock: bool = 
     """
     if styl_stock is None:
         ct = _code_type(ticker_full)
-        styl_stock = ct in ("stock_jp", "fund")  # 指数(index_jp)はstyl=stockなし
+        styl_stock = ct == "stock_jp"  # 投資信託・指数はstyl=stock無しの方が安定（500エラー回避）
 
     base_url = f"https://finance.yahoo.co.jp/quote/{ticker_full}/history"
     today = datetime.today()
@@ -561,6 +637,8 @@ def fetch_price_long(code: str, days: int = 0) -> pd.DataFrame:
       1. yfinance（日本株/米国株/指数）
       2. Yahoo Finance スクレイピング（投資信託/日本指数 yfinanceで取れないもの）
       3. kabutan.jp（米国指数フォールバック）
+      4. JSONキャッシュとマージ（上記すべてで長期データが取れない投資信託等向け）
+         取得できた直近データをキャッシュに追記し、次回以降は過去分として積み上がる。
 
     days=0: 全期間 / days>0: 直近N日
     """
@@ -584,6 +662,27 @@ def fetch_price_long(code: str, days: int = 0) -> pd.DataFrame:
         slug = _KABUTAN_MAP.get(code.lstrip("^"))
         if slug:
             df = _kabutan_history(slug, days=0)
+
+    # 4. 上記すべて失敗、または取得できた期間が短い場合はキャッシュを併用
+    #    （投資信託は1ページ目=直近20日分しか取れないため、これが主経路になる）
+    cached = cache_load_df(code)
+    if not cached.empty:
+        if df.empty:
+            df = cached
+            print(f"[キャッシュ利用] {code}: {len(df)}件（長期スクレイピング不可のため自前蓄積データを使用）")
+        else:
+            # 新規取得分とキャッシュを日付マージ（新規取得分を優先）
+            merged = pd.concat([cached, df], ignore_index=True)
+            df = merged.drop_duplicates("_dt", keep="last").sort_values("_dt").reset_index(drop=True)
+            df = _finalize_price_df(df)
+            print(f"[キャッシュ統合] {code}: キャッシュ{len(cached)}件 + 新規{len(df)-len(cached) if len(df)>=len(cached) else 0}件 → 計{len(df)}件")
+
+    # 新規取得できたデータ（短期でも）は必ずキャッシュに追記しておく
+    # → 次回以降、取得のたびに過去分が積み上がっていく
+    if not df.empty:
+        ct = _code_type(code)
+        if ct in ("fund", "index_jp"):  # 長期スクレイピングが不安定な種別のみキャッシュ運用
+            cache_append(code, df)
 
     if df.empty:
         return df
@@ -804,6 +903,9 @@ def fetch_one(code) -> dict:
         l=pd.DataFrame(columns=LEND_COLS)
         m=pd.DataFrame(columns=MARGIN_COLS)
     p=fetch_price(code); time.sleep(1)
+    # 短期データも取りこぼし防止のためキャッシュに追記（投資信託・日本指数のみ）
+    if not p.empty and _code_type(_normalize_jp_code(code)) in ("fund", "index_jp"):
+        cache_append(_normalize_jp_code(code), p)
     p_long=fetch_price_long(code, days=0)
     return {"name":name,"lending":l,"price":p,"price_long":p_long,
             "margin":m,"pressure":judge_pressure(l,p)}
