@@ -1,8 +1,7 @@
 streamlit
 pandas
 plotly
-yfinance
+yfinance      
 requests
 beautifulsoup4
 lxml
-html5lib
