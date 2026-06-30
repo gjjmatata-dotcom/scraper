@@ -23,13 +23,24 @@ STOCKS = {
     "9984": {"name": "SBG"},
 }
 
-# ── 銘柄種別判定 ─────────────────────────────────────
+# ── 銘柄種別判定・正規化 ─────────────────────────────
+def _normalize_jp_code(code: str) -> str:
+    """
+    日本株/ETFの裸コード（.Tなし）を .T 付きに正規化する。
+    投資信託(英数字8桁)・指数(998xxx)・米国系(^含む/英字)はそのまま返す。
+    例: "2869" → "2869.T" / "1570" → "1570.T" / "9I31115A" → そのまま
+    """
+    if re.fullmatch(r"[A-Z0-9]{8}", code):       return code  # 投資信託
+    if re.match(r"998\d+\.(T|O)$", code):        return code  # 指数（既に.T/.O付き）
+    if re.fullmatch(r"\d{4}[A-Z]?", code):       return f"{code}.T"  # 裸の日本株/ETFコード
+    return code
+
 def _code_type(code: str) -> str:
     """
-    投資信託 : 英数字ちょうど8桁（ドットなし）例) 9I31115A, AY311227
+    投資信託  : 英数字ちょうど8桁（ドットなし）例) 9I31115A, AY311227
     日本指数  : 998xxx.T / 998xxx.O
     日本株    : 数字+任意英字.T
-    米国株/指数: それ以外 例) ^IXIC, NDAQ, 2869.T は stock_jp
+    米国株/指数: それ以外 例) ^IXIC, NDAQ
     """
     if re.fullmatch(r"[A-Z0-9]{8}", code):  return "fund"
     if re.match(r"998\d+\.(T|O)$", code):   return "index_jp"
@@ -91,17 +102,31 @@ def _parse_yaku(txt):
     m = re.search(r"[\d.]+", s.replace(",",""))
     return float(m.group()) if m else None
 
-def _fetch(url, referer="https://irbank.net/") -> tuple:
+def _fetch(url, referer="https://irbank.net/", retries=3) -> tuple:
+    """
+    HTTPリクエストを行う。500系エラーや一時的な失敗は待機してリトライする。
+    （修正前は最初の試行で200以外なら即returnしていたためリトライが機能していなかった）
+    """
     h = {**HEADERS, "Referer": referer}
-    for _ in range(2):
+    last_status = 0
+    for attempt in range(retries):
         try:
             r = requests.get(url, headers=h, timeout=20)
-            if r.status_code == 200: return r.text, 200
+            if r.status_code == 200:
+                return r.text, 200
+            last_status = r.status_code
+            # 500系（サーバー側一時エラー）やレート制限は待って再試行
+            if r.status_code >= 500 or r.status_code == 429:
+                wait = 1.5 * (attempt + 1)
+                time.sleep(wait)
+                continue
+            # 404等は再試行しても無駄なので即終了
             return "", r.status_code
         except Exception as e:
             print(f"[取得エラー] {url}: {e}")
-        time.sleep(1)
-    return "", 0
+            last_status = 0
+        time.sleep(1.5 * (attempt + 1))
+    return "", last_status
 
 def _get_rows(html, keywords):
     if not html: return []
@@ -407,8 +432,6 @@ def _yahoo_scrape_history(ticker_full: str, years: int = 10, styl_stock: bool = 
     base_url = f"https://finance.yahoo.co.jp/quote/{ticker_full}/history"
     today = datetime.today()
     all_recs = []
-    is_fund_flag = None
-    legacy_used = False
 
     for y in range(years):
         to_dt   = today - timedelta(days=365*y)
@@ -423,27 +446,34 @@ def _yahoo_scrape_history(ticker_full: str, years: int = 10, styl_stock: bool = 
             url = f"{base_url}?{params}"
             html, status = _fetch(url, referer="https://finance.yahoo.co.jp/")
             if not html or status != 200:
+                if page == 1:
+                    print(f"[Yahoo scrape] {ticker_full} {y}年目 status={status} (from/to方式失敗)")
                 break
             is_fund, recs = _parse_history_table(html)
             if is_fund is None or not recs:
+                if page == 1:
+                    print(f"[Yahoo scrape] {ticker_full} {y}年目 テーブル無し/0件 (from/to方式)")
                 break
-            is_fund_flag = is_fund
             year_recs.extend(recs)
             time.sleep(0.4)
             if len(recs) < 20:  # ページ末尾（1ページ20件未満なら終端）
                 break
 
         if not year_recs:
-            # from/to が効かない銘柄（投資信託の一部）はレガシー ?page=N 形式にフォールバック
+            # from/to が効かない銘柄（投資信託等）はレガシー ?page=N 形式にフォールバック
             if y == 0 and not all_recs:
-                legacy_used = True
+                print(f"[Yahoo scrape] {ticker_full}: from/to方式失敗 → レガシー?page=N方式へ")
                 for page in range(1, 21):
                     url = base_url if page == 1 else f"{base_url}?page={page}"
                     html, status = _fetch(url, referer="https://finance.yahoo.co.jp/")
-                    if not html or status != 200: break
+                    if not html or status != 200:
+                        print(f"[Yahoo scrape] {ticker_full} legacy page={page} status={status}")
+                        break
                     is_fund, recs = _parse_history_table(html)
-                    if is_fund is None or not recs: break
-                    is_fund_flag = is_fund
+                    if is_fund is None or not recs:
+                        if page == 1:
+                            print(f"[Yahoo scrape] {ticker_full} legacy: テーブル未検出")
+                        break
                     all_recs.extend(recs)
                     time.sleep(0.4)
                     if len(recs) < 20: break
@@ -455,6 +485,7 @@ def _yahoo_scrape_history(ticker_full: str, years: int = 10, styl_stock: bool = 
             break
 
     if not all_recs:
+        print(f"[Yahoo scrape] {ticker_full}: 全方式で0件")
         return pd.DataFrame()
 
     df = pd.DataFrame(all_recs)
@@ -533,6 +564,9 @@ def fetch_price_long(code: str, days: int = 0) -> pd.DataFrame:
 
     days=0: 全期間 / days>0: 直近N日
     """
+    # 裸の日本株コード(例:"2869")を "2869.T" に正規化してから判定・取得する
+    code = _normalize_jp_code(code)
+
     df = pd.DataFrame()
 
     # 1. yfinance
@@ -593,9 +627,18 @@ def fetch_price(code, days=35) -> pd.DataFrame:
 
     print(f"[{code}] IRバンクchart失敗 → Yahoo Finance scrape")
     base = code.upper()
-    suffixes = ([".T",""] if re.fullmatch(r"\d{4}", base)
-                else [".T",".O",".N",".L",""] if re.fullmatch(r"\d{6}", base)
-                else ["",".T"])
+    ct = _code_type(base)
+    if ct == "fund":
+        suffixes = [""]               # 投資信託: コードそのまま、.T等は付けない
+    elif ct == "index_jp":
+        suffixes = [""]               # 既に998xxx.T/.O形式
+    elif re.fullmatch(r"\d{4}[A-Z]?", base):
+        suffixes = [".T"]             # 裸の日本株/ETFコード
+    elif re.fullmatch(r"\d{6}", base):
+        suffixes = [".T",".O",".N",".L"]
+    else:
+        suffixes = [""]               # 米国株/指数等はそのまま
+
     for sfx in suffixes:
         df = _yahoo_scrape_history(f"{base}{sfx}", years=1)
         if not df.empty:
@@ -618,9 +661,10 @@ def fetch_price_by_url(url: str, name: str = "", days: int = 0) -> pd.DataFrame:
     elif "finance.yahoo.co.jp" in url:
         m = re.search(r"/quote/([^/]+)/", url)
         ticker = m.group(1) if m else ""
+        # fetch_price_long が yfinance→スクレイピング→kabutanを内部で順に試すため、
+        # ここで _yahoo_scrape_history を再度呼ぶと完全な重複リクエストになり
+        # サーバーへの負荷増加・レート制限の誘発につながっていた。重複削除。
         df = fetch_price_long(ticker, days=days)
-        if df.empty:
-            df = _yahoo_scrape_history(ticker, years=10)
     else:
         df = pd.DataFrame()
     if not df.empty:
