@@ -1,13 +1,9 @@
 """
-dashboard.py  v3
+dashboard.py  v4
 変更点:
-  - ② 週次信用残グラフ削除（テーブルは残す）
-  - ③ テーブルに信用倍率・買い残増減率・売り残増減率・信用需給ネット を追記
-  - ③ テーブル表示列をチャートと同じチェックボックスで制御
-  - 信用需給ネット定義を脚注に表示
-  - 大口機関判定定義を修正（①×1.5超かつ±1.5% ②±4%超かつ×1.2超）
-  - DB銘柄追加サイドバー: 保存先ファイルを選択アップロード式に対応
-  - 重複コード整理・軽量化
+  - Supabase クラウドキャッシュ対応（SUPABASE_URL/KEY 環境変数で自動切替）
+  - AI要約機能追加（ANTHROPIC_API_KEY 環境変数で有効化）
+    要約対象: 買い/売り圧力判定・信用残推移・最新テクニカル指標・株価動向
 """
 import streamlit as st
 import pandas as pd
@@ -16,7 +12,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scraper import (fetch_one, fetch_price_by_url, fetch_price_long,
                      calc_technicals, STOCKS, _safe_int_fmt)
-import socket, re, json
+import socket, re, json, os, requests as _requests
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -254,6 +250,140 @@ TECH_TABLE_COLS = {
     "モメンタム":        ["Momentum"],
     "ROC":              ["ROC"],
 }
+
+# ════════════════════════════════════════
+# AI 要約（Claude API）
+# ════════════════════════════════════════
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+def _build_summary_prompt(code: str, name: str, info: dict) -> str:
+    """AI要約用のプロンプトを組み立てる"""
+    P   = info.get("price",    pd.DataFrame())
+    M   = info.get("margin",   pd.DataFrame())
+    L   = info.get("lending",  pd.DataFrame())
+    pl  = info.get("price_long", pd.DataFrame())
+    pr  = info.get("pressure", {})
+
+    lines = [
+        f"銘柄: {code} {name}",
+        f"需給判定: {pr.get('label','-')} / {pr.get('detail','-')}",
+    ]
+
+    # 最新株価
+    if not P.empty:
+        latest = P.sort_values("_dt", ascending=False).iloc[0]
+        lines.append(f"直近株価: {latest.get('終値','N/A')} 円"
+                     f" (前日比: {latest.get('前日比%','N/A'):+.2f}%)"
+                     if pd.notna(latest.get('前日比%')) else
+                     f"直近株価: {latest.get('終値','N/A')}")
+        # 直近5日の前日比をサマリ
+        recent5 = P.sort_values("_dt", ascending=False).head(5)
+        chg5 = recent5["前日比%"].dropna().tolist()
+        if chg5:
+            lines.append(f"直近5日前日比(%): {[round(v,2) for v in chg5]}")
+
+    # テクニカル指標（長期データから計算）
+    if not pl.empty:
+        from scraper import calc_technicals
+        pa = pl.sort_values("_dt", ascending=True).reset_index(drop=True)
+        pa = calc_technicals(pa)
+        if not pa.empty:
+            last = pa.iloc[-1]
+            tech_items = []
+            for col, label in [("RSI","RSI"),("SlowK","SlowK"),("SlowD","SlowD"),
+                                ("MACD","MACD"),("ADX","ADX"),("ROC","ROC%"),
+                                ("MA25","MA25"),("MA75","MA75"),("BB_%B","BB%B")]:
+                if col in pa.columns and pd.notna(last.get(col)):
+                    tech_items.append(f"{label}={last[col]:.2f}")
+            if tech_items:
+                lines.append("テクニカル最新: " + " / ".join(tech_items))
+
+    # 週次信用残
+    if not M.empty:
+        ms = M.sort_values("_dt", ascending=False).head(4)
+        m_items = []
+        for _, row in ms.iterrows():
+            buy = row.get("買い残高"); sell = row.get("売り残高")
+            ratio = row.get("信用倍率")
+            b_chg = row.get("買い残増減率"); s_chg = row.get("売り残増減率")
+            d = row.get("日付","-")
+            m_items.append(
+                f"{d}: 買い残{fmt(buy)} 売り残{fmt(sell)}"
+                f" 倍率{fmt(ratio,2)} 買い増減{fmt(b_chg,1,'%')} 売り増減{fmt(s_chg,1,'%')}")
+        lines.append("週次信用残(直近4週):\n" + "\n".join(m_items))
+
+    # 貸借（直近3日）
+    if not L.empty:
+        ls = L.sort_values("_dt", ascending=False).head(3)
+        l_items = []
+        for _, row in ls.iterrows():
+            l_items.append(
+                f"{row.get('申込日','-')}: 買い残{fmt(row.get('買い残高'))}"
+                f" 売り残{fmt(row.get('売り残高'))} 倍率{fmt(row.get('貸借倍率'),2)}"
+                f" 逆日歩{fmt(row.get('逆日歩'),2)}")
+        lines.append("貸借残(直近3日):\n" + "\n".join(l_items))
+
+    lines.append(
+        "\n以上のデータをもとに、投資家向けに株価動向・需給バランス・"
+        "テクニカル指標のポイントを200〜300字程度で日本語で要約してください。"
+        "特に注目すべき点・リスク要因があれば強調してください。"
+        "投資推奨ではなく情報整理として記述してください。")
+
+    return "\n".join(lines)
+
+def render_ai_summary(code: str, info: dict):
+    """AI要約UIを描画する。ANTHROPIC_API_KEY未設定時は設定ガイドを表示。"""
+    name = info.get("name", code)
+
+    with st.expander("🤖 AI要約（Claude）", expanded=False):
+        if not ANTHROPIC_API_KEY:
+            st.info(
+                "AI要約を有効にするには `ANTHROPIC_API_KEY` 環境変数を設定してください。\n\n"
+                "**ローカル実行時**: `.env` ファイルまたはコマンドプロンプトで\n"
+                "`set ANTHROPIC_API_KEY=sk-ant-...`\n\n"
+                "**Render**: Dashboard → Environment → Add Environment Variable\n"
+                "`ANTHROPIC_API_KEY` = `sk-ant-...`\n\n"
+                "APIキーは https://console.anthropic.com で取得できます。"
+            )
+            return
+
+        btn_key = f"ai_btn_{code}"
+        result_key = f"ai_result_{code}"
+
+        if st.button("📝 要約を生成", key=btn_key):
+            with st.spinner("Claude が分析中..."):
+                prompt = _build_summary_prompt(code, name, info)
+                try:
+                    resp = _requests.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers={
+                            "x-api-key": ANTHROPIC_API_KEY,
+                            "anthropic-version": "2023-06-01",
+                            "content-type": "application/json",
+                        },
+                        json={
+                            "model": "claude-sonnet-4-6",
+                            "max_tokens": 600,
+                            "messages": [{"role": "user", "content": prompt}],
+                        },
+                        timeout=30,
+                    )
+                    if resp.status_code == 200:
+                        result = resp.json()["content"][0]["text"]
+                        st.session_state[result_key] = result
+                    else:
+                        st.error(f"API エラー {resp.status_code}: {resp.text[:200]}")
+                except Exception as e:
+                    st.error(f"通信エラー: {e}")
+
+        if result_key in st.session_state:
+            st.markdown(
+                f"<div style='background:#161b22;border-radius:8px;padding:14px;"
+                f"border:1px solid #30363d;color:#c9d1d9;font-size:13px;line-height:1.7'>"
+                f"{st.session_state[result_key].replace(chr(10),'<br>')}</div>",
+                unsafe_allow_html=True)
+            st.caption(f"※ Claude claude-sonnet-4-6 による自動要約。投資勧誘ではありません。")
+
 
 # ════════════════════════════════════════
 # ③ テクニカル分析セクション
@@ -657,6 +787,9 @@ def render_stock(code, info, col_hex):
       <span style="font-size:1.05rem;font-weight:700;color:{prc}">{pr['label']}</span>
       <span style="color:#8b949e;font-size:0.82rem;margin-left:10px">{pr['detail']}</span>
     </div>""", unsafe_allow_html=True)
+
+    # ── AI要約 ────────────────────────────────────────
+    render_ai_summary(code, info)
 
     # ── 表示期間選択 ─────────────────────────────
     period_key=f"period_{code}"

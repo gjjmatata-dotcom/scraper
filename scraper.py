@@ -27,72 +27,152 @@ STOCKS = {
 }
 
 # ════════════════════════════════════════
-# JSON蓄積キャッシュ（長期スクレイピングが効かない銘柄用）
+# 価格キャッシュ（Supabase優先 / ローカルJSONフォールバック）
 # ════════════════════════════════════════
-CACHE_FILE = Path(os.environ.get("PRICE_CACHE_PATH", "price_history_cache.json"))
+# ─ 環境変数 ─
+#   SUPABASE_URL : https://xxxx.supabase.co
+#   SUPABASE_KEY : anon公開キー
+#   （未設定時は price_history_cache.json にローカル保存）
+# ─ Supabase テーブル（一度だけSQL Editorで実行） ─
+#   create table price_cache (
+#     code  text not null,
+#     date  text not null,
+#     data  jsonb not null,
+#     primary key (code, date)
+#   );
 
-# 保存する列のみに絞る（軽量化のため最小限）
-_CACHE_COLS = ["始値","高値","安値","終値","出来高","基準価額","純資産(百万)","PER","PBR"]
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+_USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
 
-def _load_cache() -> dict:
-    """price_history_cache.json 全体を読み込む。{code: {date: {col:val,...}}} 形式。"""
-    if not CACHE_FILE.exists():
+CACHE_FILE   = Path(os.environ.get("PRICE_CACHE_PATH", "price_history_cache.json"))
+_CACHE_COLS  = ["始値","高値","安値","終値","出来高","基準価額","純資産(百万)","PER","PBR"]
+
+
+# ── Supabase REST API ヘルパー ───────────────────────
+def _sb_headers() -> dict:
+    return {
+        "apikey":        SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "resolution=merge-duplicates",  # upsert
+    }
+
+def _sb_url(path="") -> str:
+    return f"{SUPABASE_URL}/rest/v1/price_cache{path}"
+
+
+def _supa_load(code: str) -> dict:
+    """Supabase から指定銘柄の全行を {date: {col:val}} 形式で返す。"""
+    try:
+        r = requests.get(
+            _sb_url(f"?code=eq.{code}&select=date,data"),
+            headers=_sb_headers(), timeout=10)
+        if r.status_code != 200:
+            print(f"[Supabase読込エラー] {r.status_code}: {r.text[:100]}")
+            return {}
+        return {row["date"]: row["data"] for row in r.json()}
+    except Exception as e:
+        print(f"[Supabase読込例外] {e}")
         return {}
+
+def _supa_upsert(code: str, rows: list):
+    """
+    rows = [{"code": code, "date": "2026-06-01", "data": {...}}, ...]
+    Supabase に upsert（INSERT OR UPDATE）する。
+    一度に最大500行送信。
+    """
+    CHUNK = 500
+    for i in range(0, len(rows), CHUNK):
+        chunk = rows[i:i+CHUNK]
+        try:
+            r = requests.post(
+                _sb_url(),
+                headers=_sb_headers(),
+                json=chunk, timeout=20)
+            if r.status_code not in (200, 201):
+                print(f"[Supabase書込エラー] {r.status_code}: {r.text[:150]}")
+        except Exception as e:
+            print(f"[Supabase書込例外] {e}")
+
+
+# ── ローカル JSON ヘルパー ───────────────────────────
+def _local_load() -> dict:
+    if not CACHE_FILE.exists(): return {}
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        print(f"[キャッシュ読込エラー] {e}")
-        return {}
+        print(f"[ローカルキャッシュ読込エラー] {e}"); return {}
 
-def _save_cache(cache: dict):
-    """全体を書き戻す。書き込みは銘柄追加時のみなので頻度は低く軽量。"""
+def _local_save(cache: dict):
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, separators=(",", ":"))
     except Exception as e:
-        print(f"[キャッシュ保存エラー] {e}")
+        print(f"[ローカルキャッシュ保存エラー] {e}")
 
+
+# ── 公開インターフェース ─────────────────────────────
 def cache_append(code: str, df: pd.DataFrame):
     """
-    取得した df（_dt列必須）の行をキャッシュに追記する。
-    既存日付は上書き（最新値で更新）、新規日付は追加。
-    呼び出しごとに全体load/saveするが、JSONは小さいため動作への影響は軽微。
+    取得した df をキャッシュに追記する。
+    Supabase が設定されていればクラウドに、なければローカルJSONに保存。
+    新規日付のみ書き込み（既存日付は最新値で上書き）。
     """
     if df.empty or "_dt" not in df.columns:
         return
-    cache = _load_cache()
-    bucket = cache.setdefault(code, {})
-    added = 0
+
+    # DataFrame → {date_key: {col:val}} に変換
+    new_entries: dict[str, dict] = {}
     for _, row in df.iterrows():
         date_key = row["_dt"].strftime("%Y-%m-%d")
-        is_new = date_key not in bucket
         entry = {}
         for c in _CACHE_COLS:
             if c in df.columns:
                 v = row.get(c)
                 entry[c] = None if pd.isna(v) else float(v)
-        bucket[date_key] = entry
-        if is_new: added += 1
-    if added > 0:
-        _save_cache(cache)
-        print(f"[キャッシュ追記] {code}: 新規{added}件 / 累計{len(bucket)}件")
+        new_entries[date_key] = entry
+
+    if _USE_SUPABASE:
+        # 既存日付を取得して差分だけ送信（リクエスト削減）
+        existing = set(_supa_load(code).keys())
+        rows_to_write = [
+            {"code": code, "date": d, "data": v}
+            for d, v in new_entries.items()
+        ]
+        if rows_to_write:
+            _supa_upsert(code, rows_to_write)
+            new_count = sum(1 for d in new_entries if d not in existing)
+            print(f"[Supabaseキャッシュ] {code}: 新規{new_count}件 upsert / 累計{len(existing)+new_count}件")
+    else:
+        cache = _local_load()
+        bucket = cache.setdefault(code, {})
+        added = sum(1 for d in new_entries if d not in bucket)
+        bucket.update(new_entries)
+        if added > 0:
+            _local_save(cache)
+            print(f"[ローカルキャッシュ] {code}: 新規{added}件 / 累計{len(bucket)}件")
+
 
 def cache_load_df(code: str) -> pd.DataFrame:
     """キャッシュから指定銘柄の全期間データをDataFrameで返す。無ければ空。"""
-    cache = _load_cache()
-    bucket = cache.get(code, {})
+    if _USE_SUPABASE:
+        bucket = _supa_load(code)
+    else:
+        bucket = _local_load().get(code, {})
+
     if not bucket:
         return pd.DataFrame()
+
     recs = []
     for date_key, entry in bucket.items():
-        try:
-            dt = datetime.strptime(date_key, "%Y-%m-%d")
-        except Exception:
-            continue
+        try: dt = datetime.strptime(date_key, "%Y-%m-%d")
+        except Exception: continue
         rec = {"_dt": dt}
         rec.update(entry)
         recs.append(rec)
+
     if not recs:
         return pd.DataFrame()
     df = pd.DataFrame(recs).sort_values("_dt").reset_index(drop=True)
