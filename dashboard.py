@@ -252,137 +252,236 @@ TECH_TABLE_COLS = {
 }
 
 # ════════════════════════════════════════
-# AI 要約（Claude API）
+# AI 分析（Groq 優先 / Claude フォールバック）
 # ════════════════════════════════════════
+# 環境変数:
+#   GROQ_API_KEY      : https://console.groq.com で無料取得
+#   ANTHROPIC_API_KEY : https://console.anthropic.com （どちらか一方で可）
+
+GROQ_API_KEY      = os.environ.get("GROQ_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+_AI_AVAILABLE     = bool(GROQ_API_KEY or ANTHROPIC_API_KEY)
 
-def _build_summary_prompt(code: str, name: str, info: dict) -> str:
-    """AI要約用のプロンプトを組み立てる"""
-    P   = info.get("price",    pd.DataFrame())
-    M   = info.get("margin",   pd.DataFrame())
-    L   = info.get("lending",  pd.DataFrame())
-    pl  = info.get("price_long", pd.DataFrame())
-    pr  = info.get("pressure", {})
+def _call_ai(prompt: str, max_tokens: int = 2000) -> str:
+    """Groq優先でAI APIを呼び出す。なければClaudeにフォールバック。"""
+    if GROQ_API_KEY:
+        try:
+            r = _requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": "llama-3.3-70b-versatile",
+                      "max_tokens": max_tokens,
+                      "messages": [{"role": "user", "content": prompt}]},
+                timeout=60)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"]
+            print(f"[Groq] {r.status_code}: {r.text[:150]}")
+        except Exception as e:
+            print(f"[Groq例外] {e}")
+    if ANTHROPIC_API_KEY:
+        try:
+            r = _requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY,
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": "claude-sonnet-4-6",
+                      "max_tokens": max_tokens,
+                      "messages": [{"role": "user", "content": prompt}]},
+                timeout=60)
+            if r.status_code == 200:
+                return r.json()["content"][0]["text"]
+            print(f"[Claude] {r.status_code}: {r.text[:150]}")
+        except Exception as e:
+            print(f"[Claude例外] {e}")
+    return "AIへの接続に失敗しました。APIキーと通信環境を確認してください。"
 
-    lines = [
-        f"銘柄: {code} {name}",
-        f"需給判定: {pr.get('label','-')} / {pr.get('detail','-')}",
-    ]
 
-    # 最新株価
-    if not P.empty:
-        latest = P.sort_values("_dt", ascending=False).iloc[0]
-        lines.append(f"直近株価: {latest.get('終値','N/A')} 円"
-                     f" (前日比: {latest.get('前日比%','N/A'):+.2f}%)"
-                     if pd.notna(latest.get('前日比%')) else
-                     f"直近株価: {latest.get('終値','N/A')}")
-        # 直近5日の前日比をサマリ
-        recent5 = P.sort_values("_dt", ascending=False).head(5)
-        chg5 = recent5["前日比%"].dropna().tolist()
-        if chg5:
-            lines.append(f"直近5日前日比(%): {[round(v,2) for v in chg5]}")
+def _build_analysis_prompt(code: str, name: str, df_all: pd.DataFrame,
+                            M: pd.DataFrame, period_label: str) -> str:
+    if df_all.empty:
+        return "データが不足しているため分析できません。"
 
-    # テクニカル指標（長期データから計算）
-    if not pl.empty:
-        from scraper import calc_technicals
-        pa = pl.sort_values("_dt", ascending=True).reset_index(drop=True)
-        pa = calc_technicals(pa)
-        if not pa.empty:
-            last = pa.iloc[-1]
-            tech_items = []
-            for col, label in [("RSI","RSI"),("SlowK","SlowK"),("SlowD","SlowD"),
-                                ("MACD","MACD"),("ADX","ADX"),("ROC","ROC%"),
-                                ("MA25","MA25"),("MA75","MA75"),("BB_%B","BB%B")]:
-                if col in pa.columns and pd.notna(last.get(col)):
-                    tech_items.append(f"{label}={last[col]:.2f}")
-            if tech_items:
-                lines.append("テクニカル最新: " + " / ".join(tech_items))
+    def sc(col):
+        return df_all[col] if col in df_all.columns else pd.Series(dtype=float)
 
-    # 週次信用残
-    if not M.empty:
-        ms = M.sort_values("_dt", ascending=False).head(4)
-        m_items = []
-        for _, row in ms.iterrows():
-            buy = row.get("買い残高"); sell = row.get("売り残高")
-            ratio = row.get("信用倍率")
-            b_chg = row.get("買い残増減率"); s_chg = row.get("売り残増減率")
-            d = row.get("日付","-")
-            m_items.append(
-                f"{d}: 買い残{fmt(buy)} 売り残{fmt(sell)}"
-                f" 倍率{fmt(ratio,2)} 買い増減{fmt(b_chg,1,'%')} 売り増減{fmt(s_chg,1,'%')}")
-        lines.append("週次信用残(直近4週):\n" + "\n".join(m_items))
+    top5   = df_all.nlargest(5,  "前日比%")[["日付","終値","前日比%","25日乖離率"]].dropna(subset=["前日比%"])
+    worst5 = df_all.nsmallest(5, "前日比%")[["日付","終値","前日比%","25日乖離率"]].dropna(subset=["前日比%"])
 
-    # 貸借（直近3日）
-    if not L.empty:
-        ls = L.sort_values("_dt", ascending=False).head(3)
-        l_items = []
-        for _, row in ls.iterrows():
-            l_items.append(
-                f"{row.get('申込日','-')}: 買い残{fmt(row.get('買い残高'))}"
-                f" 売り残{fmt(row.get('売り残高'))} 倍率{fmt(row.get('貸借倍率'),2)}"
-                f" 逆日歩{fmt(row.get('逆日歩'),2)}")
-        lines.append("貸借残(直近3日):\n" + "\n".join(l_items))
+    df_s = df_all.sort_values("_dt").reset_index(drop=True)
+    df_s["next1"] = df_s["前日比%"].shift(-1)
+    df_s["next2"] = df_s["前日比%"].shift(-2)
+    df_s["next5"] = df_s["終値"].pct_change(5).shift(-5) * 100
 
-    lines.append(
-        "\n以上のデータをもとに、投資家向けに株価動向・需給バランス・"
-        "テクニカル指標のポイントを200〜300字程度で日本語で要約してください。"
-        "特に注目すべき点・リスク要因があれば強調してください。"
-        "投資推奨ではなく情報整理として記述してください。")
+    dev = sc("25日乖離率").dropna()
+    dev_mean = dev.mean() if not dev.empty else float("nan")
+    dev_min  = dev.min()  if not dev.empty else float("nan")
+    dev_max  = dev.max()  if not dev.empty else float("nan")
+    dev_lt   = int((dev < -10).sum())
+    dev_gt   = int((dev > 10).sum())
 
-    return "\n".join(lines)
+    has_ohlc = all(c in df_all.columns for c in ["始値","高値","安値","終値"])
+    candle_info = "OHLC列なし"
+    if has_ohlc:
+        o = df_s["始値"]; h = df_s["高値"]; l = df_s["安値"]; c2 = df_s["終値"]
+        body   = (c2 - o).abs()
+        range_ = h - l
+        lw     = pd.concat([o,c2],axis=1).min(axis=1) - l
+        bull   = (c2>o) & (body>range_*0.6)
+        bear   = (c2<o) & (body>range_*0.6)
+        lwlong = lw > body*1.5
+        cross  = body < range_*0.1
+        pats = []
+        for lbl, mask in [("大陽線",bull),("大陰線",bear),("下ヒゲ長",lwlong),("十字線",cross)]:
+            n = int(mask.sum())
+            if n < 3: continue
+            vals = df_s["next1"][mask].dropna()
+            if len(vals) < 3: continue
+            up_r = float((vals>0).mean()*100)
+            pats.append(f"{lbl}(N={n}): 翌日上昇率{up_r:.0f}% 平均{float(vals.mean()):+.2f}%")
+        candle_info = "\n".join(pats) if pats else "件数不足"
 
-def render_ai_summary(code: str, info: dict):
-    """AI要約UIを描画する。ANTHROPIC_API_KEY未設定時は設定ガイドを表示。"""
+    cur_up=0; cur_dn=0; max_up=0; max_dn=0; up3=0; dn3=0
+    for v in df_s["前日比%"].dropna():
+        if v>0: cur_up+=1; cur_dn=0
+        else:   cur_dn+=1; cur_up=0
+        if cur_up>=3: up3+=1
+        if cur_dn>=3: dn3+=1
+        max_up=max(max_up,cur_up); max_dn=max(max_dn,cur_dn)
+
+    margin_info = "信用残データなし"
+    if not M.empty and "信用倍率" in M.columns:
+        mg = M["信用倍率"].dropna()
+        if not mg.empty:
+            margin_info = f"平均{float(mg.mean()):.2f}倍 最小{float(mg.min()):.2f}倍 最大{float(mg.max()):.2f}倍"
+
+    def stat_block(mask):
+        cnt = int(mask.sum())
+        if cnt < 3: return f"件数{cnt}件(不足)"
+        vals = df_s["next1"][mask].dropna()
+        if len(vals) < 3: return "翌日データ不足"
+        return f"件数{cnt}件 翌日平均{float(vals.mean()):+.2f}% 上昇率{float((vals>0).mean()*100):.0f}%"
+
+    def dev_stat(cond):
+        mask = cond
+        if not isinstance(mask, pd.Series): return ""
+        cnt = int(mask.sum())
+        if cnt < 3: return ""
+        vals = df_s["next5"][mask].dropna()
+        return f"(N={cnt}) 翌5日平均{float(vals.mean()):+.2f}%" if not vals.empty else ""
+
+    n   = len(df_s)
+    p0  = df_s["日付"].iloc[0]  if n>0 else "-"
+    p1  = df_s["日付"].iloc[-1] if n>0 else "-"
+
+    prompt = f"""あなたは株式テクニカル分析の専門家です。
+「{code} {name}」の{period_label}分（{p0}〜{p1}、全{n}営業日）の実データ統計から
+再現性60%以上の法則・売買ルール候補を日本語で報告してください。
+
+## 指示
+- 指標は各項目で最大3つに絞る
+- 確率は実データから計算した数値を使う（推測禁止）
+- データが少ない場合は「データ不足」と記載し過剰な結論を避ける
+- 投資推奨ではなく法則の整理として記述
+
+## 実データ統計
+
+【前日比トップ5（急騰日）】
+{top5.to_string(index=False)}
+
+【前日比ワースト5（急落日）】
+{worst5.to_string(index=False)}
+
+【急騰翌日（前日比+3%超）】{stat_block(df_s["前日比%"]>3)}
+【急落翌日（前日比-3%以下）】{stat_block(df_s["前日比%"]<-3)}
+
+【25日乖離率】平均{dev_mean:+.2f}% 下限{dev_min:+.2f}% 上限{dev_max:+.2f}%
+乖離-10%以下: {dev_lt}日 {dev_stat(sc("25日乖離率")<-10)}
+乖離+10%以上: {dev_gt}日 {dev_stat(sc("25日乖離率")>10)}
+
+【ローソク足パターン翌日統計】
+{candle_info}
+
+【連騰・連落】最大連騰{max_up}日 最大連落{max_dn}日 3日連騰{up3}回 3日連落{dn3}回
+
+【信用倍率】{margin_info}
+
+## 出力形式
+
+**① 急騰・急落パターン（前日比%）**
+トップ5・ワースト5の前後リターンと信用倍率の関係。再現性の高い法則を最大3指標で。
+
+**② 25日乖離率の法則**
+下限・上限それぞれの後のリターン。信用倍率との関連も言及。
+
+**③ ローソク足パターン**
+60%以上の再現性があるパターンのみ記述。
+
+**④ 連騰・連落条件**
+3連騰/3連落が起きやすい条件を最大3指標で。
+
+**⑤ 総合売買ルール候補（再現性最高）**
+買いシグナル: [指標A]●● かつ [指標B]●● → 確率●%で●日後に●%上昇 (N=●)
+売りシグナル: 同様に記述
+"""
+    return prompt
+
+
+def render_ai_summary(code: str, info: dict, period_label: str = "全期間"):
+    """AI分析UIを描画する。"""
     name = info.get("name", code)
 
-    with st.expander("🤖 AI要約（Claude）", expanded=False):
-        if not ANTHROPIC_API_KEY:
-            st.info(
-                "AI要約を有効にするには `ANTHROPIC_API_KEY` 環境変数を設定してください。\n\n"
-                "**ローカル実行時**: `.env` ファイルまたはコマンドプロンプトで\n"
-                "`set ANTHROPIC_API_KEY=sk-ant-...`\n\n"
-                "**Render**: Dashboard → Environment → Add Environment Variable\n"
-                "`ANTHROPIC_API_KEY` = `sk-ant-...`\n\n"
-                "APIキーは https://console.anthropic.com で取得できます。"
-            )
+    with st.expander("🤖 AI売買ルール分析（Groq / Claude）", expanded=False):
+        if not _AI_AVAILABLE:
+            st.info("""**AIを有効にする方法（どちらか一方でOK・両方とも無料）**
+
+**① Groq（推奨・完全無料・高速）**
+1. https://console.groq.com でアカウント作成
+2. API Keys → Create API Key
+3. Renderの環境変数: `GROQ_API_KEY` = `gsk_...`
+
+**② Claude（Anthropic）**
+1. https://console.anthropic.com でアカウント作成
+2. API Keys → Create Key
+3. Renderの環境変数: `ANTHROPIC_API_KEY` = `sk-ant-...`
+
+**ローカルPCの場合:**
+コマンドプロンプトで実行前に
+`set GROQ_API_KEY=gsk_...` を実行してから
+`python -m streamlit run dashboard.py`""")
             return
 
-        btn_key = f"ai_btn_{code}"
         result_key = f"ai_result_{code}"
+        btn_key    = f"ai_btn_{code}"
 
-        if st.button("📝 要約を生成", key=btn_key):
-            with st.spinner("Claude が分析中..."):
-                prompt = _build_summary_prompt(code, name, info)
-                try:
-                    resp = _requests.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers={
-                            "x-api-key": ANTHROPIC_API_KEY,
-                            "anthropic-version": "2023-06-01",
-                            "content-type": "application/json",
-                        },
-                        json={
-                            "model": "claude-sonnet-4-6",
-                            "max_tokens": 600,
-                            "messages": [{"role": "user", "content": prompt}],
-                        },
-                        timeout=30,
-                    )
-                    if resp.status_code == 200:
-                        result = resp.json()["content"][0]["text"]
-                        st.session_state[result_key] = result
-                    else:
-                        st.error(f"API エラー {resp.status_code}: {resp.text[:200]}")
-                except Exception as e:
-                    st.error(f"通信エラー: {e}")
+        st.caption("📊 表示期間内の実データから統計的法則を探索します（再現性60%以上の売買ルール候補を出力）")
+        run = st.button("🔍 分析実行", key=btn_key)
+
+        if run:
+            pl = info.get("price_long", pd.DataFrame())
+            M  = info.get("margin",     pd.DataFrame())
+            if pl.empty:
+                st.warning("長期データが不足しています。データ蓄積後に再実行してください。")
+                return
+            with st.spinner("統計計算中 → AI分析中（10〜30秒）..."):
+                from scraper import calc_technicals
+                df_tech = calc_technicals(
+                    pl.sort_values("_dt", ascending=True).reset_index(drop=True))
+                prompt  = _build_analysis_prompt(code, name, df_tech, M, period_label)
+                result  = _call_ai(prompt, max_tokens=2000)
+                st.session_state[result_key] = result
 
         if result_key in st.session_state:
-            st.markdown(
-                f"<div style='background:#161b22;border-radius:8px;padding:14px;"
-                f"border:1px solid #30363d;color:#c9d1d9;font-size:13px;line-height:1.7'>"
-                f"{st.session_state[result_key].replace(chr(10),'<br>')}</div>",
-                unsafe_allow_html=True)
-            st.caption(f"※ Claude claude-sonnet-4-6 による自動要約。投資勧誘ではありません。")
+            st.markdown(st.session_state[result_key])
+            provider = "Groq (LLaMA-3.3-70b)" if GROQ_API_KEY else "Claude (claude-sonnet-4-6)"
+            st.caption(f"※ {provider} による統計分析。投資勧誘ではありません。")
+            st.download_button(
+                "💾 分析結果をダウンロード",
+                data=st.session_state[result_key].encode("utf-8"),
+                file_name=f"ai_analysis_{code}_{pd.Timestamp.now().strftime('%Y%m%d')}.txt",
+                mime="text/plain",
+                key=f"dl_{code}")
 
 
 # ════════════════════════════════════════
@@ -789,7 +888,7 @@ def render_stock(code, info, col_hex):
     </div>""", unsafe_allow_html=True)
 
     # ── AI要約 ────────────────────────────────────────
-    render_ai_summary(code, info)
+    render_ai_summary(code, info, period_label=period_label)
 
     # ── 表示期間選択 ─────────────────────────────
     period_key=f"period_{code}"
