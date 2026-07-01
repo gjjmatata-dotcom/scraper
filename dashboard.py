@@ -263,38 +263,56 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 _AI_AVAILABLE     = bool(GROQ_API_KEY or ANTHROPIC_API_KEY)
 
 def _call_ai(prompt: str, max_tokens: int = 2000) -> str:
-    """Groq優先でAI APIを呼び出す。なければClaudeにフォールバック。"""
+    """
+    Groq優先でAI APIを呼び出す。なければClaudeにフォールバック。
+    json= パラメータではなく data= に手動UTF-8エンコードを使うことで
+    'latin-1 codec can't encode' エラーを回避。
+    """
+    import json as _json
+
     if GROQ_API_KEY:
         try:
+            payload = _json.dumps({
+                "model": "llama-3.3-70b-versatile",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}]
+            }, ensure_ascii=False).encode("utf-8")
             r = _requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}",
-                         "Content-Type": "application/json"},
-                json={"model": "llama-3.3-70b-versatile",
-                      "max_tokens": max_tokens,
-                      "messages": [{"role": "user", "content": prompt}]},
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                data=payload,
                 timeout=60)
             if r.status_code == 200:
                 return r.json()["choices"][0]["message"]["content"]
             print(f"[Groq] {r.status_code}: {r.text[:150]}")
         except Exception as e:
             print(f"[Groq例外] {e}")
+
     if ANTHROPIC_API_KEY:
         try:
+            payload = _json.dumps({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}]
+            }, ensure_ascii=False).encode("utf-8")
             r = _requests.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": ANTHROPIC_API_KEY,
-                         "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-6",
-                      "max_tokens": max_tokens,
-                      "messages": [{"role": "user", "content": prompt}]},
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json; charset=utf-8",
+                },
+                data=payload,
                 timeout=60)
             if r.status_code == 200:
                 return r.json()["content"][0]["text"]
             print(f"[Claude] {r.status_code}: {r.text[:150]}")
         except Exception as e:
             print(f"[Claude例外] {e}")
+
     return "AIへの接続に失敗しました。APIキーと通信環境を確認してください。"
 
 
@@ -429,7 +447,7 @@ def _build_analysis_prompt(code: str, name: str, df_all: pd.DataFrame,
 
 
 def render_ai_summary(code: str, info: dict, period_label: str = "全期間"):
-    """AI分析UIを描画する。"""
+    """AI分析UIを描画する。period_labelに応じてデータを絞り込んで分析する。"""
     name = info.get("name", code)
 
     with st.expander("🤖 AI売買ルール分析（Groq / Claude）", expanded=False):
@@ -452,10 +470,11 @@ def render_ai_summary(code: str, info: dict, period_label: str = "全期間"):
 `python -m streamlit run dashboard.py`""")
             return
 
-        result_key = f"ai_result_{code}"
-        btn_key    = f"ai_btn_{code}"
+        # ── 表示期間でキーを分ける（期間変更→ボタン再押しで再分析） ──
+        result_key = f"ai_result_{code}_{period_label}"
+        btn_key    = f"ai_btn_{code}_{period_label}"
 
-        st.caption("📊 表示期間内の実データから統計的法則を探索します（再現性60%以上の売買ルール候補を出力）")
+        st.caption(f"📊 **{period_label}** のデータから統計的法則を探索します（再現性60%以上の売買ルール候補）")
         run = st.button("🔍 分析実行", key=btn_key)
 
         if run:
@@ -464,22 +483,45 @@ def render_ai_summary(code: str, info: dict, period_label: str = "全期間"):
             if pl.empty:
                 st.warning("長期データが不足しています。データ蓄積後に再実行してください。")
                 return
-            with st.spinner("統計計算中 → AI分析中（10〜30秒）..."):
+
+            with st.spinner(f"【{period_label}】統計計算中 → AI分析中（10〜30秒）..."):
                 from scraper import calc_technicals
-                df_tech = calc_technicals(
-                    pl.sort_values("_dt", ascending=True).reset_index(drop=True))
-                prompt  = _build_analysis_prompt(code, name, df_tech, M, period_label)
+                from datetime import datetime, timedelta
+
+                # ── 表示期間でフィルタ ──
+                period_days = PERIOD_OPTIONS.get(period_label, 0)
+                pl_sorted = pl.sort_values("_dt", ascending=True).reset_index(drop=True)
+                if period_days > 0:
+                    cutoff = datetime.today() - timedelta(days=period_days)
+                    pl_filtered = pl_sorted[pl_sorted["_dt"] >= cutoff].reset_index(drop=True)
+                else:
+                    pl_filtered = pl_sorted
+
+                if pl_filtered.empty or len(pl_filtered) < 10:
+                    st.warning(f"【{period_label}】の期間にデータが少なすぎます（{len(pl_filtered)}件）。期間を広げてください。")
+                    return
+
+                # 信用残も同期間に絞る
+                M_filtered = pd.DataFrame()
+                if not M.empty and "_dt" in M.columns and period_days > 0:
+                    cutoff = datetime.today() - timedelta(days=period_days)
+                    M_filtered = M[M["_dt"] >= cutoff].reset_index(drop=True)
+                elif not M.empty:
+                    M_filtered = M
+
+                df_tech = calc_technicals(pl_filtered)
+                prompt  = _build_analysis_prompt(code, name, df_tech, M_filtered, period_label)
                 result  = _call_ai(prompt, max_tokens=2000)
                 st.session_state[result_key] = result
 
         if result_key in st.session_state:
             st.markdown(st.session_state[result_key])
             provider = "Groq (LLaMA-3.3-70b)" if GROQ_API_KEY else "Claude (claude-sonnet-4-6)"
-            st.caption(f"※ {provider} による統計分析。投資勧誘ではありません。")
+            st.caption(f"※ {provider} による統計分析（対象期間: {period_label}）。投資勧誘ではありません。")
             st.download_button(
                 "💾 分析結果をダウンロード",
                 data=st.session_state[result_key].encode("utf-8"),
-                file_name=f"ai_analysis_{code}_{pd.Timestamp.now().strftime('%Y%m%d')}.txt",
+                file_name=f"ai_analysis_{code}_{period_label}_{pd.Timestamp.now().strftime('%Y%m%d')}.txt",
                 mime="text/plain",
                 key=f"dl_{code}")
 
