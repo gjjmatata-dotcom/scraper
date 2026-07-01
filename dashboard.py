@@ -887,9 +887,6 @@ def render_stock(code, info, col_hex):
       <span style="color:#8b949e;font-size:0.82rem;margin-left:10px">{pr['detail']}</span>
     </div>""", unsafe_allow_html=True)
 
-    # ── AI要約 ────────────────────────────────────────
-    render_ai_summary(code, info, period_label=period_label)
-
     # ── 表示期間選択 ─────────────────────────────
     period_key=f"period_{code}"
     if period_key not in st.session_state: st.session_state[period_key]="6ヶ月"
@@ -903,6 +900,9 @@ def render_stock(code, info, col_hex):
     if not p_long.empty:
         d_min=p_long["_dt"].min(); d_max=p_long["_dt"].max()
         st.caption(f"📂 長期データ: {len(p_long)}営業日 / {d_min.strftime('%Y/%m/%d')} ～ {d_max.strftime('%Y/%m/%d')}")
+
+    # ── AI要約（period_label定義後に呼ぶ）────────
+    render_ai_summary(code, info, period_label=period_label)
 
     # ① 貸借取引残高
     if not L.empty:
