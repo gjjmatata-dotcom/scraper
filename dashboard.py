@@ -769,245 +769,324 @@ def render_technical_section(code, info, col_hex, period_days):
     fig_base(fig3,420+130*len(sub_inds))
     st.plotly_chart(fig3,use_container_width=True)
 
-    # ── 株価テーブル（信用残カラム含む） ──────
+    # ── 株価テーブル ───────────────────────────────
     st.markdown("**📋 株価テーブル**")
 
-    M=info.get("margin",pd.DataFrame())
+    M = info.get("margin", pd.DataFrame())
 
-    # ── 表示期間ベースで全指標を再計算 ──────────
+    # ══ 表示期間ベースで全指標再計算 ═══════════════
     Pa_asc = Pa.sort_values("_dt", ascending=True).reset_index(drop=True)
     has_ohlc = all(c in Pa_asc.columns for c in ["高値","安値","始値","終値"])
     n_period = len(Pa_asc)
 
-    # 日中幅（高値-安値）と表示期間内平均・3倍閾値
+    # 日中幅 ─ 表示期間内平均の2倍閾値（3倍→2倍に変更）
     if has_ohlc:
-        range_series       = (Pa_asc["高値"] - Pa_asc["安値"]).fillna(0)
-        range_mean_period  = range_series.mean()
-        range_3x           = range_mean_period * 3
+        range_series      = (Pa_asc["高値"] - Pa_asc["安値"]).fillna(0)
+        range_mean_period = range_series.mean()
+        range_2x          = range_mean_period * 2   # ← 2倍閾値
     else:
-        range_series = pd.Series([0.0]*n_period)
-        range_mean_period = 0.0; range_3x = 0.0
+        range_series = pd.Series([0.0]*n_period, index=Pa_asc.index)
+        range_mean_period = 0.0; range_2x = 0.0
 
-    # 出来高平均（表示期間）
-    vol_period = Pa_asc["出来高"].fillna(0) if "出来高" in Pa_asc.columns else pd.Series([0.0]*n_period)
-    vm_period  = vol_period.mean()
-    ret_period = Pa_asc["前日比%"].abs().fillna(0) if "前日比%" in Pa_asc.columns else pd.Series([0.0]*n_period)
+    # 出来高・前日比（表示期間）
+    vol_s = Pa_asc["出来高"].fillna(0) if "出来高" in Pa_asc.columns else pd.Series([0.0]*n_period)
+    vm_p  = vol_s.mean()
+    ret_s = Pa_asc["前日比%"].abs().fillna(0) if "前日比%" in Pa_asc.columns else pd.Series([0.0]*n_period)
 
-    # 機関異常・出来高異常フラグ（表示期間ベース）
-    Pa_asc["機関異常_p"]  = ((vol_period > vm_period*1.5) & (ret_period >= 1.5)) | \
-                            ((ret_period >= 4.0) & (vol_period > vm_period*1.2))
-    Pa_asc["出来高異常_p"]= vol_period > vm_period * 2
+    # 機関異常・出来高異常（表示期間ベース）
+    Pa_asc["機関異常_p"]  = ((vol_s > vm_p*1.5) & (ret_s >= 1.5)) | ((ret_s >= 4.0) & (vol_s > vm_p*1.2))
+    Pa_asc["出来高異常_p"]= vol_s > vm_p * 2
 
-    # BB乖離率（±1σ / ±2σ）と バンドウォーク判定
-    # BB_upper=+2σ, BB_lower=-2σ は calc_technicals 済み
+    # ── %B（0〜100スケール）──────────────────────
+    # BB_%B = (終値-下限)/(上限-下限)  →  0が下限、100が上限、50が中心
     if all(c in Pa_asc.columns for c in ["終値","BB_upper","BB_lower","BB_mid"]):
-        c_  = Pa_asc["終値"]
-        mid = Pa_asc["BB_mid"]
-        sig = (Pa_asc["BB_upper"] - mid) / 2   # 1σ = (2σライン - 中心) / 2
-        sig = sig.replace(0, float("nan"))
-        Pa_asc["BB_1s_dev"] = ((c_ - mid) / sig).round(2)      # +1σ=1.0, -1σ=-1.0
-        Pa_asc["BB_2s_dev"] = ((c_ - mid) / (sig*2)).round(2)  # +2σ=1.0, -2σ=-1.0
-        # バンドウォーク: 3日連続で+2σ超 or -2σ超
-        above2 = c_ > Pa_asc["BB_upper"]
-        below2 = c_ < Pa_asc["BB_lower"]
-        Pa_asc["BW_up"]   = above2 & above2.shift(1).fillna(False) & above2.shift(2).fillna(False)
-        Pa_asc["BW_dn"]   = below2 & below2.shift(1).fillna(False) & below2.shift(2).fillna(False)
+        c_   = Pa_asc["終値"]
+        bbu  = Pa_asc["BB_upper"]; bbl = Pa_asc["BB_lower"]
+        band = (bbu - bbl).replace(0, float("nan"))
+        Pa_asc["pctB"] = ((c_ - bbl) / band * 100).round(1)  # 0〜100, 50=中心
     else:
-        Pa_asc["BB_1s_dev"] = float("nan")
-        Pa_asc["BB_2s_dev"] = float("nan")
-        Pa_asc["BW_up"]     = False
-        Pa_asc["BW_dn"]     = False
+        Pa_asc["pctB"] = float("nan")
 
-    # SAR乖離率（終値とSARの差 / 終値）
-    if "SAR" in Pa_asc.columns and "終値" in Pa_asc.columns:
-        sar_safe = Pa_asc["SAR"].replace(0, float("nan"))
-        Pa_asc["SAR_dev%"] = ((Pa_asc["終値"] - Pa_asc["SAR"]) / Pa_asc["終値"] * 100).round(2)
+    # ── SAR乖離率 ─────────────────────────────────
+    if "SAR" in Pa_asc.columns:
+        Pa_asc["SAR_dev"] = ((Pa_asc["終値"] - Pa_asc["SAR"]) / Pa_asc["終値"] * 100).round(2)
     else:
-        Pa_asc["SAR_dev%"] = float("nan")
+        Pa_asc["SAR_dev"] = float("nan")
 
-    # MACD_hist 前日差
+    # ── MACD_hist 前日差 ───────────────────────────
     if "MACD_hist" in Pa_asc.columns:
         Pa_asc["MACD_hist_chg"] = Pa_asc["MACD_hist"].diff().round(2)
     else:
         Pa_asc["MACD_hist_chg"] = float("nan")
 
-    # 降順に変換
-    Pa_desc2 = Pa_asc.sort_values("_dt", ascending=False).reset_index(drop=True)
+    # ══ トレンド通過フラグ（当日のみ） ══════════════
+    # 各ラインを昨日下にいて今日上抜け → 上向きシグナル（逆は下向き）
+    # 対象: +2σ, +1σ, 25MA, SAR（上抜け）/ -1σ, -2σ, 25MA, SAR（下抜け）
+    def _cross_flag(series: pd.Series, ref: pd.Series):
+        """今日 > ref かつ 昨日 <= ref → True（上抜け当日）"""
+        prev = series.shift(1); prev_ref = ref.shift(1)
+        up   = (series > ref) & (prev <= prev_ref)
+        dn   = (series < ref) & (prev >= prev_ref)
+        return up.fillna(False), dn.fillna(False)
 
-    # ── ローソク足記号生成（日中幅3倍超の日のみ） ──
+    tr_flags = {}  # キー: 列名 → (up_series, dn_series)
+    if all(c in Pa_asc.columns for c in ["終値","BB_upper","BB_lower","BB_mid","MA25","SAR"]):
+        c_   = Pa_asc["終値"]
+        bbu  = Pa_asc["BB_upper"]; bbl = Pa_asc["BB_lower"]
+        mid  = Pa_asc["BB_mid"]
+        # 1σ ライン = 中心 ± (2σ-中心)/2
+        sig1u = mid + (bbu - mid)/2
+        sig1l = mid - (bbu - mid)/2
+        ma25  = Pa_asc["MA25"]
+        sar   = Pa_asc["SAR"]
+
+        u2up, u2dn = _cross_flag(c_, bbu)   # +2σ
+        u1up, u1dn = _cross_flag(c_, sig1u) # +1σ
+        l1up, l1dn = _cross_flag(c_, sig1l) # -1σ (下抜けがシグナル)
+        l2up, l2dn = _cross_flag(c_, bbl)   # -2σ
+        maup, madn = _cross_flag(c_, ma25)  # 25MA
+        sarup,sardn= _cross_flag(c_, sar)   # SAR
+
+        # トレンド列テキスト（複数シグナルを当日まとめる）
+        def _trend_str(i):
+            up_sigs, dn_sigs = [], []
+            if u2up.iloc[i]:  up_sigs.append("◎+2σ↑")
+            if u1up.iloc[i]:  up_sigs.append("○+1σ↑")
+            if maup.iloc[i]:  up_sigs.append("△25MA↑")
+            if sarup.iloc[i]: up_sigs.append("▷SAR↑")
+            if l2dn.iloc[i]:  dn_sigs.append("◎-2σ↓")
+            if l1dn.iloc[i]:  dn_sigs.append("○-1σ↓")
+            if madn.iloc[i]:  dn_sigs.append("▽25MA↓")
+            if sardn.iloc[i]: dn_sigs.append("◁SAR↓")
+            parts = up_sigs + dn_sigs
+            return " ".join(parts) if parts else ""
+
+        Pa_asc["トレンド"] = [_trend_str(i) for i in range(len(Pa_asc))]
+        # 行カラーリング用フラグ
+        Pa_asc["TR_up"] = u2up | u1up | maup | sarup
+        Pa_asc["TR_dn"] = l2dn | l1dn | madn | sardn
+    else:
+        Pa_asc["トレンド"] = ""
+        Pa_asc["TR_up"] = False
+        Pa_asc["TR_dn"] = False
+
+    # ══ ローソク足記号（日中幅 2倍超の日のみ） ══════
     def _candle_symbol(row) -> str:
-        if range_3x <= 0: return ""
+        if range_2x <= 0: return ""
         try:
             h=float(row.get("高値",float("nan"))); l=float(row.get("安値",float("nan")))
             o=float(row.get("始値",float("nan"))); c=float(row.get("終値",float("nan")))
         except (TypeError,ValueError): return ""
         if any(v!=v for v in [h,l,o,c]): return ""
         total=h-l
-        if total<=0 or total<=range_3x: return ""
+        if total<=0 or total<=range_2x: return ""
         body=abs(c-o); up_w=h-max(c,o); dn_w=min(c,o)-l
         is_bull=c>=o
-        body_r=body/total; up_r=up_w/total; dn_r=dn_w/total
-        if body_r>=0.7:   return "▲大陽" if is_bull else "▼大陰"
-        if body_r<0.15:
-            if dn_r>=0.4:  return "⊥下ヒゲ十字"
-            if up_r>=0.4:  return "⊤上ヒゲ十字"
-            return "＋十字"
-        if dn_r>=0.4 and up_r<0.15: return "↑下ヒゲ陽" if is_bull else "↑下ヒゲ陰"
-        if up_r>=0.4 and dn_r<0.15: return "↓上ヒゲ陽" if is_bull else "↓上ヒゲ陰"
-        if up_r>=0.25 and dn_r>=0.25: return "↕コマ陽" if is_bull else "↕コマ陰"
-        return "△陽" if is_bull else "▽陰"
+        body_r=body/total if total>0 else 0
+        up_r=up_w/total  if total>0 else 0
+        dn_r=dn_w/total  if total>0 else 0
+        # ローソク足パターン判定（実体・ヒゲ比率）
+        if body_r >= 0.7:
+            return "[大陽線]" if is_bull else "[大陰線]"
+        if body_r < 0.1:
+            if dn_r >= 0.45: return "[ドジ下ヒゲ]"
+            if up_r >= 0.45: return "[ドジ上ヒゲ]"
+            if dn_r >= 0.3 and up_r >= 0.3: return "[十字]"
+            return "[四値同値]"
+        if dn_r >= 0.45 and body_r < 0.35:
+            return "[下ヒゲ長陽]" if is_bull else "[トンカチ陰]"
+        if up_r >= 0.45 and body_r < 0.35:
+            return "[トンカチ陽]" if is_bull else "[上ヒゲ長陰]"
+        if dn_r >= 0.3 and up_r >= 0.3:
+            return "[コマ陽]" if is_bull else "[コマ陰]"
+        if body_r >= 0.4:
+            return "[陽線]" if is_bull else "[陰線]"
+        return "[小陽]" if is_bull else "[小陰]"
 
-    # ── テーブル構築 ─────────────────────────────
-    # 選択されたテクニカル列
-    tech_cols=[]
+    # ══ 降順変換 ════════════════════════════════════
+    Pa_desc2 = Pa_asc.sort_values("_dt", ascending=False).reset_index(drop=True)
+
+    # ══ テーブル構築 ════════════════════════════════
+    # 選択テクニカル列（ただし後で固定順で配置するため収集のみ）
+    sel_tech = []
     for opt in selected:
         if opt not in CHART_ONLY:
-            tech_cols+=TECH_TABLE_COLS.get(opt,[])
-    tech_cols=[c for c in tech_cols if c in Pa_desc2.columns]
+            sel_tech += TECH_TABLE_COLS.get(opt, [])
+    sel_tech = [c for c in dict.fromkeys(sel_tech) if c in Pa_desc2.columns]
 
-    pt=pd.DataFrame()
-    pt["日付"]=Pa_desc2["日付"]
+    pt = pd.DataFrame()
+    pt["日付"] = Pa_desc2["日付"]
 
-    # ローソク足（終値の直前に配置）
+    # ローソク足（日付の右隣）
     if has_ohlc:
-        pt["ローソク"]=Pa_desc2.apply(_candle_symbol,axis=1)
+        pt["ローソク"] = Pa_desc2.apply(_candle_symbol, axis=1)
+
+    # トレンド通過シグナル列
+    if "トレンド" in Pa_desc2.columns:
+        pt["トレンド"] = Pa_desc2["トレンド"]
 
     # 価格列
     for c in ["始値","高値","安値","終値","基準価額"]:
         if c in Pa_desc2.columns:
-            pt[c]=Pa_desc2[c].apply(lambda v:f"¥{v:,.1f}" if pd.notna(v) else "-")
+            pt[c] = Pa_desc2[c].apply(lambda v: f"¥{v:,.1f}" if pd.notna(v) else "-")
     if "出来高" in Pa_desc2.columns:
-        pt["出来高"]=Pa_desc2["出来高"].apply(lambda v:f"{int(v):,}" if pd.notna(v) else "-")
+        pt["出来高"] = Pa_desc2["出来高"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "-")
     if "前日比%" in Pa_desc2.columns:
-        pt["前日比%"]=Pa_desc2["前日比%"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
+        pt["前日比%"] = Pa_desc2["前日比%"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
     if "25日乖離率" in Pa_desc2.columns:
-        pt["25日乖離率"]=Pa_desc2["25日乖離率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
+        pt["25日乖離率"] = Pa_desc2["25日乖離率"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
 
-    # BB乖離率
-    if "BB_1s_dev" in Pa_desc2.columns:
-        pt["BB±1σ"]=Pa_desc2["BB_1s_dev"].apply(lambda v:f"{v:+.2f}σ" if pd.notna(v) else "-")
-        pt["BB±2σ"]=Pa_desc2["BB_2s_dev"].apply(lambda v:f"{v:+.2f}σ" if pd.notna(v) else "-")
+    # ══ 固定列順（25日乖離率の右以降）═══════════════
+    # %B（0〜100スケール）
+    if "pctB" in Pa_desc2.columns:
+        pt["%B"] = Pa_desc2["pctB"].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "-")
 
-    # SAR乖離率
-    if "SAR_dev%" in Pa_desc2.columns:
-        pt["SAR乖離%"]=Pa_desc2["SAR_dev%"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
+    # RSI
+    if "RSI" in Pa_desc2.columns and "RSI" in sel_tech:
+        pt["RSI"] = Pa_desc2["RSI"].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "-")
 
-    # 信用残カラム
+    # 信用残
     if not M.empty:
-        M_d=M.sort_values("_dt").set_index("_dt")
-        def _find_margin(dt,col):
+        M_d = M.sort_values("_dt").set_index("_dt")
+        def _fm(dt, col):
             try:
-                past=M_d[M_d.index<=dt]
+                past = M_d[M_d.index <= dt]
                 return past[col].iloc[-1] if not past.empty else None
             except: return None
-        pt["信用倍率"]=Pa_desc2["_dt"].apply(
-            lambda dt: fmt(_find_margin(dt,"信用倍率"),dec=2,suffix="倍"))
-        pt["買い残増減率"]=Pa_desc2["_dt"].apply(
-            lambda dt: (lambda v:f"{v:+.2f}%" if pd.notna(v) and v==v else "-")
-                       (_find_margin(dt,"買い残増減率")))
-        pt["売り残増減率"]=Pa_desc2["_dt"].apply(
-            lambda dt: (lambda v:f"{v:+.2f}%" if pd.notna(v) and v==v else "-")
-                       (_find_margin(dt,"売り残増減率")))
-        def _credit_side(dt):
-            b=_find_margin(dt,"買い残増減率"); s=_find_margin(dt,"売り残増減率")
+        pt["信用倍率"]   = Pa_desc2["_dt"].apply(lambda dt: fmt(_fm(dt,"信用倍率"),dec=2,suffix="倍"))
+        pt["買い残増減率"]= Pa_desc2["_dt"].apply(lambda dt: (lambda v: f"{v:+.2f}%" if pd.notna(v) and v==v else "-")(_fm(dt,"買い残増減率")))
+        pt["売り残増減率"]= Pa_desc2["_dt"].apply(lambda dt: (lambda v: f"{v:+.2f}%" if pd.notna(v) and v==v else "-")(_fm(dt,"売り残増減率")))
+        def _cs(dt):
+            b=_fm(dt,"買い残増減率"); s=_fm(dt,"売り残増減率")
             if b is None or s is None or b!=b or s!=s: return "-"
-            return "🟢買い優勢" if b>s else "🔴売り優勢" if s>b else "⚪中立"
-        pt["信用需給"]=Pa_desc2["_dt"].apply(_credit_side)
+            return "🟢買い" if b>s else "🔴売り" if s>b else "⚪"
+        pt["信用需給"] = Pa_desc2["_dt"].apply(_cs)
 
-    # テクニカル列（MACD_histの直後にMACD_hist前日差を挿入）
-    for tc in tech_cols:
-        if tc not in Pa_desc2.columns: continue
-        pt[tc]=Pa_desc2[tc].apply(lambda v:f"{v:.2f}" if pd.notna(v) else "-")
-        if tc=="MACD_hist" and "MACD_hist_chg" in Pa_desc2.columns:
-            pt["MACD_hist差"]=Pa_desc2["MACD_hist_chg"].apply(
-                lambda v:f"{v:+.2f}" if pd.notna(v) else "-")
+    # SAR乖離%
+    if "SAR_dev" in Pa_desc2.columns:
+        pt["SAR乖離%"] = Pa_desc2["SAR_dev"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
 
-    # ── スタイリング ─────────────────────────────
+    # MACD_hist差 → MACD_signal → MACD_hist（固定順）
+    if "MACD_hist_chg" in Pa_desc2.columns:
+        pt["MACD_hist差"] = Pa_desc2["MACD_hist_chg"].apply(lambda v: f"{v:+.2f}" if pd.notna(v) else "-")
+    for tc in ["MACD_signal","MACD_hist"]:
+        if tc in Pa_desc2.columns and tc in sel_tech:
+            pt[tc] = Pa_desc2[tc].apply(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
+
+    # その他選択テクニカル列（上記固定列以外）
+    fixed = {"RSI","MACD_signal","MACD_hist"}
+    for tc in sel_tech:
+        if tc not in fixed and tc not in pt.columns and tc in Pa_desc2.columns:
+            pt[tc] = Pa_desc2[tc].apply(lambda v: f"{v:.2f}" if pd.notna(v) else "-")
+
+    # ══ スタイリング ════════════════════════════════
+    # 行カラー優先順位:
+    # 1. トレンド上抜け（薄青）2. トレンド下抜け（薄赤）
+    # 3. 機関異常（濃赤）4. 出来高急増（黄）
+    date_to_idx = {row["日付"]: i for i, row in Pa_desc2.iterrows()}
+
     def sty_pt(row):
-        cl=list(row.index); styles=[""]*len(cl)
+        cl = list(row.index); styles = [""] * len(cl)
+        d  = row.get("日付","")
+        idx0 = date_to_idx.get(d)
 
-        # ── 行単位背景（優先順位順） ──
-        # バンドウォーク上抜け（+2σ超×3日連続）→ 青背景
-        bw_idx = Pa_desc2.index[Pa_desc2["日付"]==row.get("日付","")] if "日付" in row else []
-        if len(bw_idx)>0:
-            idx0=bw_idx[0]
-            if Pa_desc2.loc[idx0,"BW_up"]:
-                return ["background-color:#0d2137;color:#79c0ff"]*len(cl)
-            if Pa_desc2.loc[idx0,"BW_dn"]:
-                return ["background-color:#2d0f1a;color:#ffa198"]*len(cl)
-            # 機関異常（大口）→ 濃赤背景
-            if Pa_desc2.loc[idx0,"機関異常_p"]:
-                return ["background-color:#3d0d0d;color:#ffa198"]*len(cl)
-            # 出来高異常 → 黄背景
-            if Pa_desc2.loc[idx0,"出来高異常_p"]:
-                return ["background-color:#2d1f00;color:#e3b341"]*len(cl)
+        if idx0 is not None:
+            tr_up = bool(Pa_desc2.loc[idx0,"TR_up"])
+            tr_dn = bool(Pa_desc2.loc[idx0,"TR_dn"])
+            ki    = bool(Pa_desc2.loc[idx0,"機関異常_p"])
+            vk    = bool(Pa_desc2.loc[idx0,"出来高異常_p"])
 
-        # ── 列単位の色付け ──
-        for cn,suffix in [("前日比%","%"),("25日乖離率","%"),("ROC",""),
-                          ("買い残増減率","%"),("売り残増減率","%"),("MACD_hist差",""),
-                          ("SAR乖離%","%")]:
+            if tr_up:
+                # 薄青背景 + 文字は列ごとの色を維持するため背景のみ指定
+                for i in range(len(cl)):
+                    styles[i] = "background-color:#0a1f35"
+            elif tr_dn:
+                for i in range(len(cl)):
+                    styles[i] = "background-color:#2a0d0d"
+            elif ki:
+                for i in range(len(cl)):
+                    styles[i] = "background-color:#3d0d0d"
+            elif vk:
+                for i in range(len(cl)):
+                    styles[i] = "background-color:#2d1f00"
+
+        # 列ごとの文字色（数値の正負）
+        for cn in ["前日比%","25日乖離率","ROC","買い残増減率","売り残増減率",
+                   "MACD_hist差","SAR乖離%"]:
             if cn in cl:
-                i=cl.index(cn)
+                i = cl.index(cn)
                 try:
-                    v=float(str(row[cn]).replace("%","").replace("+","").replace("σ",""))
-                    styles[i]=f"color:{vc(v)};font-weight:600"
+                    v = float(str(row[cn]).replace("%","").replace("+",""))
+                    c_style = f"color:{vc(v)};font-weight:600"
+                    styles[i] = (styles[i] + ";" + c_style).lstrip(";")
                 except: pass
 
-        # ローソク足色（陽線=青 / 陰線=赤）
+        # %B 色（50=中心, 80以上=強上昇, 20以下=強下落）
+        if "%B" in cl:
+            i = cl.index("%B")
+            try:
+                v = float(str(row["%B"]))
+                if v >= 80:   c_s = "color:#f85149;font-weight:700"
+                elif v >= 60: c_s = "color:#e3b341"
+                elif v <= 20: c_s = "color:#58a6ff;font-weight:700"
+                elif v <= 40: c_s = "color:#79c0ff"
+                else:         c_s = "color:#8b949e"
+                styles[i] = (styles[i] + ";" + c_s).lstrip(";")
+            except: pass
+
+        # ローソク足色
         if "ローソク" in cl:
-            i=cl.index("ローソク"); sym=str(row.get("ローソク",""))
-            if any(k in sym for k in ["陽","↑","コマ陽","△"]):
-                styles[i]="color:#58a6ff;font-weight:700"
-            elif any(k in sym for k in ["陰","↓","コマ陰","▽","⊥","⊤","＋"]):
-                styles[i]="color:#f85149;font-weight:700"
+            i = cl.index("ローソク"); sym = str(row.get("ローソク",""))
+            if any(k in sym for k in ["陽","下ヒゲ長陽","ドジ下ヒゲ","コマ陽","小陽"]):
+                styles[i] = (styles[i] + ";color:#58a6ff;font-weight:700").lstrip(";")
+            elif any(k in sym for k in ["陰","トンカチ","ドジ上ヒゲ","コマ陰","小陰"]):
+                styles[i] = (styles[i] + ";color:#f85149;font-weight:700").lstrip(";")
 
-        # BB乖離率（±1σ超=ハイライト / ±2σ近辺=強調）
-        for bb_col in ["BB±1σ","BB±2σ"]:
-            if bb_col in cl:
-                i=cl.index(bb_col)
-                try:
-                    v=float(str(row[bb_col]).replace("σ","").replace("+",""))
-                    if abs(v)>=1.8:
-                        styles[i]=f"color:{'#f85149' if v>0 else '#58a6ff'};font-weight:700"
-                    elif abs(v)>=0.8:
-                        styles[i]=f"color:{'#e3b341' if v>0 else '#79c0ff'}"
-                except: pass
+        # トレンド列色（上向きシグナル=青 / 下向き=赤）
+        if "トレンド" in cl:
+            i = cl.index("トレンド"); t = str(row.get("トレンド",""))
+            if t:
+                if any(c in t for c in ["↑","◎+","○+"]):
+                    styles[i] = (styles[i] + ";color:#58a6ff;font-weight:700").lstrip(";")
+                if any(c in t for c in ["↓","◎-","○-"]):
+                    styles[i] = (styles[i] + ";color:#f85149;font-weight:700").lstrip(";")
 
         return styles
 
-    # ── 脚注（定義まとめ）─────────────────────────
-    caption_lines = [
-        "**【カラーリング定義】**",
-        "🔵 青行(BW上昇) = +2σ超を3日連続 → バンドウォーク上昇中（強い上昇トレンド）",
-        "🔴 赤行(BW下降) = -2σ超を3日連続 → バンドウォーク下降中（強い下降トレンド）",
-        "🟥 濃赤行 = 大口機関異常: ①出来高×1.5超かつ前日比±1.5%以上 または ②前日比±4%以上かつ出来高×1.2超",
-        "🟨 黄行  = 出来高急増: 表示期間内の出来高平均×2倍超（需給の急変シグナル）",
-        "ローソク列 🔵文字=陽線系 / 🔴文字=陰線系 ※日中幅が表示期間平均×3倍超の日のみ表示",
-        f"　ローソク足閾値（現在の表示期間）: 日中幅平均 {range_mean_period:,.0f} × 3 = {range_3x:,.0f}",
-        "**【指標定義】**",
-        "BB±1σ: (終値-BB中心)÷1σ。±0.8以上でトレンドに乗っている目安 / ±1.8以上で強いトレンド",
-        "BB±2σ: (終値-BB中心)÷2σ。1.0=+2σライン上、-1.0=-2σライン上",
-        "SAR乖離%: (終値-パラボリックSAR)÷終値×100。プラス=SAR下方(上昇トレンド) / マイナス=SAR上方(下降トレンド)",
-        "MACD_hist差: 当日MACDヒストグラム－前日。プラス=モメンタム増加 / マイナス=減少",
-    ]
-    if not M.empty:
-        caption_lines += [
-            "**【信用残定義】**",
-            "信用需給ネット = 買い残高÷日次平均出来高(日) - 売り残高÷日次平均出来高(日)",
-            "　プラス=買い残が厚い(上昇余地・需給重い両面あり) / マイナス=売り残が厚い(下落圧力・買い戻し余地)",
-            "信用需給列: 買い残増減率 > 売り残増減率 → 🟢買い優勢 / 逆 → 🔴売り優勢",
-        ]
+    range_2x_disp = f"{range_mean_period:,.0f}×2={range_2x:,.0f}" if range_2x > 0 else "N/A"
 
-    st.dataframe(pt.style.apply(sty_pt,axis=1),
-        use_container_width=True,hide_index=True,
-        height=min(38*(min(len(pt),60)+1)+38,620))
+    st.dataframe(pt.style.apply(sty_pt, axis=1),
+        use_container_width=True, hide_index=True,
+        height=min(38*(min(len(pt),60)+1)+38, 640))
 
+    # ══ 定義まとめ（エキスパンダー）═════════════════
     with st.expander("📌 カラーリング・指標定義", expanded=False):
-        for line in caption_lines:
-            if line.startswith("**"):
-                st.markdown(line)
-            else:
-                st.caption(line)
+        st.markdown("**【行カラーリング定義】**（優先順位順）")
+        st.caption("🔵 薄青行 = トレンド上抜け当日: +2σ / +1σ / 25MA / SAR のいずれかを下から上に抜けた日")
+        st.caption("🔴 薄赤行 = トレンド下抜け当日: -1σ / -2σ / 25MA / SAR のいずれかを上から下に抜けた日")
+        st.caption("🟥 濃赤行 = 大口機関異常: ①出来高×1.5超かつ前日比±1.5%以上 または ②前日比±4%以上かつ出来高×1.2超")
+        st.caption("🟨 黄行   = 出来高急増: 表示期間内出来高平均×2倍超（需給の急変シグナル）")
+        st.markdown("**【トレンド列 記号定義】**（当日通過のみ表示）")
+        st.caption("◎+2σ↑ = +2σラインを上抜け（強い上昇トレンド入り）  ◎-2σ↓ = -2σ下抜け（強い下降）")
+        st.caption("○+1σ↑ = +1σ上抜け（上昇トレンドに乗った）  ○-1σ↓ = -1σ下抜け（下降トレンド入り）")
+        st.caption("△25MA↑ / ▽25MA↓ = 25日移動平均を上/下抜け（トレンド転換の目安）")
+        st.caption("▷SAR↑ / ◁SAR↓ = パラボリックSARを上/下抜け（トレンド反転シグナル）")
+        st.markdown("**【ローソク列定義】**")
+        st.caption(f"日中幅が表示期間内平均×2倍超の日のみ表示（閾値: {range_2x_disp}）")
+        st.caption("🔵文字=陽線系 / 🔴文字=陰線系　[大陽線][大陰線][下ヒゲ長陽][トンカチ][コマ陽/陰][十字]など")
+        st.markdown("**【%B 色定義】**（ボリンジャーバンド %B, 0〜100スケール）")
+        st.caption("0=下限(-2σ) / 50=中心(25MA) / 100=上限(+2σ)")
+        st.caption("🔴80以上=上限付近（買われ過ぎ警戒）/ 🟡60〜80=上昇トレンド中 / ⚪40〜60=中立")
+        st.caption("🔵20以下=下限付近（売られ過ぎ注目）/ 🟦20〜40=下降トレンド中")
+        st.markdown("**【SAR乖離%】**")
+        st.caption("(終値-SAR)÷終値×100。プラス=SAR下方（上昇トレンド）/ マイナス=SAR上方（下降トレンド・警戒）")
+        st.markdown("**【MACD_hist差】**")
+        st.caption("当日-前日のMACDヒスト。プラス=勢い増加（買いモメンタム）/ マイナス=勢い減少")
+        if not M.empty:
+            st.markdown("**【信用残定義】**")
+            st.caption("信用需給ネット = 買い残高÷日次平均出来高(日) - 売り残高÷日次平均出来高(日)")
+            st.caption("プラス=買い残が厚い / マイナス=売り残が厚い（下落圧力・買い戻し余地）")
+            st.caption("信用需給: 🟢=買い残増減率>売り残増減率（買い優勢）/ 🔴=売り優勢")
 
     # ── 比較テーブル ─────────────────────────────
     if cmp_data:
