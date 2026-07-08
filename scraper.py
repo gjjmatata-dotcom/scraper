@@ -431,27 +431,86 @@ def fetch_lending(code) -> pd.DataFrame:
     print(f"[{code}] 貸借: {len(df)}行")
     return df
 
-def fetch_margin(code) -> pd.DataFrame:
-    html,_=_fetch(f"https://irbank.net/{code}/margin")
-    rows=_get_rows(html,["買い残高","売り残高","倍率"])
-    if not rows: return pd.DataFrame(columns=MARGIN_COLS)
-    def mapper(row,dt):
-        bb,bc=_bal_chg(row[1]) if len(row)>1 else (None,None)
-        sb,sc=_bal_chg(row[3]) if len(row)>3 else (None,None)
-        return {"_dt":dt,"日付":dt.strftime("%Y/%m/%d"),
-                "買い残高":bb,"買い増減":bc,"売り残高":sb,"売り増減":sc,
-                "信用倍率":_to_float(row[5]) if len(row)>5 else None,
-                "逆日歩":_parse_yaku(row[6]) if len(row)>6 else None}
-    recs=_parse_irbank_rows(rows,4,mapper)
-    if not recs: return pd.DataFrame(columns=MARGIN_COLS)
-    df=pd.DataFrame(recs)
-    for c in ["買い残高","買い増減","売り残高","売り増減","信用倍率","逆日歩"]:
-        df[c]=pd.to_numeric(df.get(c),errors="coerce")
-    df=df.sort_values("_dt").reset_index(drop=True)
-    df["買い残増減率"]=df["買い残高"].pct_change()*100
-    df["売り残増減率"]=df["売り残高"].pct_change()*100
-    print(f"[{code}] 信用残: {len(df)}件")
+def _fetch_shintan_margin(code: str) -> pd.DataFrame:
+    """
+    株たん (https://kabutan.jp/stock/finance?code=XXXX) の信用残データを取得。
+    IRバンクで取得できない場合のフォールバック。
+    """
+    # 4桁コードに正規化（1570.T → 1570）
+    base = re.sub(r"\.[A-Z]+$", "", code)
+    url  = f"https://kabutan.jp/stock/finance?code={base}"
+    html, status = _fetch(url, referer="https://kabutan.jp/")
+    if not html or status != 200:
+        print(f"[株たん] {code}: status={status}")
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    soup = BeautifulSoup(html, "lxml")
+    # 信用残テーブルを探す（「買い残」「売り残」を含む表）
+    tgt = next((t for t in soup.find_all("table")
+                if "買い残" in t.get_text() and "売り残" in t.get_text()), None)
+    if not tgt:
+        print(f"[株たん] {code}: 信用残テーブル未検出")
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    recs = []
+    for tr in tgt.find_all("tr"):
+        cells = [td.get_text(strip=True) for td in tr.find_all(["th","td"])]
+        if len(cells) < 4: continue
+        # 日付列を探す（YYYY/MM/DD または MM/DD形式）
+        c0 = cells[0].strip(); dt = None
+        m = (re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})", c0)
+             or re.match(r"(\d{4})年(\d{1,2})月(\d{1,2})日", c0))
+        if not m: continue
+        try: dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except: continue
+        def g(i): return _to_float(cells[i]) if len(cells) > i else None
+        recs.append({
+            "_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
+            "買い残高": g(1), "買い増減": g(2),
+            "売り残高": g(3), "売り増減": g(4),
+            "信用倍率": g(5) if len(cells) > 5 else None,
+            "逆日歩":   None,
+        })
+
+    if not recs:
+        print(f"[株たん] {code}: データ0件")
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    df = pd.DataFrame(recs)
+    for c in ["買い残高","買い増減","売り残高","売り増減","信用倍率"]:
+        df[c] = pd.to_numeric(df.get(c), errors="coerce")
+    df = df.sort_values("_dt").reset_index(drop=True)
+    df["買い残増減率"] = df["買い残高"].pct_change() * 100
+    df["売り残増減率"] = df["売り残高"].pct_change() * 100
+    print(f"[株たん] {code}: {len(df)}件取得")
     return df
+
+def fetch_margin(code) -> pd.DataFrame:
+    """週次信用残取得。IRバンク → 株たん の順でフォールバック。"""
+    html, _ = _fetch(f"https://irbank.net/{code}/margin")
+    rows = _get_rows(html, ["買い残高","売り残高","倍率"])
+    if rows:
+        def mapper(row, dt):
+            bb,bc=_bal_chg(row[1]) if len(row)>1 else (None,None)
+            sb,sc=_bal_chg(row[3]) if len(row)>3 else (None,None)
+            return {"_dt":dt,"日付":dt.strftime("%Y/%m/%d"),
+                    "買い残高":bb,"買い増減":bc,"売り残高":sb,"売り増減":sc,
+                    "信用倍率":_to_float(row[5]) if len(row)>5 else None,
+                    "逆日歩":_parse_yaku(row[6]) if len(row)>6 else None}
+        recs = _parse_irbank_rows(rows, 4, mapper)
+        if recs:
+            df = pd.DataFrame(recs)
+            for c in ["買い残高","買い増減","売り残高","売り増減","信用倍率","逆日歩"]:
+                df[c] = pd.to_numeric(df.get(c), errors="coerce")
+            df = df.sort_values("_dt").reset_index(drop=True)
+            df["買い残増減率"] = df["買い残高"].pct_change() * 100
+            df["売り残増減率"] = df["売り残高"].pct_change() * 100
+            print(f"[{code}] 信用残(IRバンク): {len(df)}件")
+            return df
+
+    # IRバンク失敗 → 株たんフォールバック
+    print(f"[{code}] IRバンク信用残なし → 株たん")
+    return _fetch_shintan_margin(code)
 
 # ════════════════════════════════════════
 # 価格 DataFrame 正規化（共通処理）

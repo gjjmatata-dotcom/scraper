@@ -798,30 +798,20 @@ def render_technical_section(code, info, col_hex, period_days):
     Pa_asc["出来高異常_p"]= vol_s > vm_p * 2
 
     # ── %B（0〜100スケール）──────────────────────
-    # BB_%B = (終値-下限)/(上限-下限)  →  0が下限、100が上限、50が中心
-    if all(c in Pa_asc.columns for c in ["終値","BB_upper","BB_lower","BB_mid"]):
+    # BB_%B は calc_technicals 済み（0〜1スケール）→ 100倍して絶対値表示
+    # BB_upper/BB_lower/MA25 は calc_technicals で必ず生成される
+    if all(c in Pa_asc.columns for c in ["終値","BB_upper","BB_lower","MA25"]):
         c_   = Pa_asc["終値"]
         bbu  = Pa_asc["BB_upper"]; bbl = Pa_asc["BB_lower"]
         band = (bbu - bbl).replace(0, float("nan"))
         Pa_asc["pctB"] = ((c_ - bbl) / band * 100).round(1)  # 0〜100, 50=中心
+    elif "BB_%B" in Pa_asc.columns:
+        # calc_technicals の BB_%B（0〜1）を100倍
+        Pa_asc["pctB"] = (Pa_asc["BB_%B"] * 100).round(1)
     else:
         Pa_asc["pctB"] = float("nan")
 
-    # ── SAR乖離率 ─────────────────────────────────
-    if "SAR" in Pa_asc.columns:
-        Pa_asc["SAR_dev"] = ((Pa_asc["終値"] - Pa_asc["SAR"]) / Pa_asc["終値"] * 100).round(2)
-    else:
-        Pa_asc["SAR_dev"] = float("nan")
-
-    # ── MACD_hist 前日差 ───────────────────────────
-    if "MACD_hist" in Pa_asc.columns:
-        Pa_asc["MACD_hist_chg"] = Pa_asc["MACD_hist"].diff().round(2)
-    else:
-        Pa_asc["MACD_hist_chg"] = float("nan")
-
     # ══ トレンド通過フラグ（当日のみ） ══════════════
-    # 各ラインを昨日下にいて今日上抜け → 上向きシグナル（逆は下向き）
-    # 対象: +2σ, +1σ, 25MA, SAR（上抜け）/ -1σ, -2σ, 25MA, SAR（下抜け）
     def _cross_flag(series: pd.Series, ref: pd.Series):
         """今日 > ref かつ 昨日 <= ref → True（上抜け当日）"""
         prev = series.shift(1); prev_ref = ref.shift(1)
@@ -829,25 +819,24 @@ def render_technical_section(code, info, col_hex, period_days):
         dn   = (series < ref) & (prev >= prev_ref)
         return up.fillna(False), dn.fillna(False)
 
-    tr_flags = {}  # キー: 列名 → (up_series, dn_series)
-    if all(c in Pa_asc.columns for c in ["終値","BB_upper","BB_lower","BB_mid","MA25","SAR"]):
+    # MA25（=BB_mid）とBB_upper/BB_lowerを使用（BB_midは存在しないためMA25で代替）
+    if all(c in Pa_asc.columns for c in ["終値","BB_upper","BB_lower","MA25","SAR"]):
         c_   = Pa_asc["終値"]
         bbu  = Pa_asc["BB_upper"]; bbl = Pa_asc["BB_lower"]
-        mid  = Pa_asc["BB_mid"]
+        mid  = Pa_asc["MA25"]       # BB_mid = MA25（25日移動平均 = BBの中心線）
         # 1σ ライン = 中心 ± (2σ-中心)/2
-        sig1u = mid + (bbu - mid)/2
-        sig1l = mid - (bbu - mid)/2
+        sig1u = mid + (bbu - mid) / 2
+        sig1l = mid - (bbu - mid) / 2
         ma25  = Pa_asc["MA25"]
         sar   = Pa_asc["SAR"]
 
-        u2up, u2dn = _cross_flag(c_, bbu)   # +2σ
-        u1up, u1dn = _cross_flag(c_, sig1u) # +1σ
-        l1up, l1dn = _cross_flag(c_, sig1l) # -1σ (下抜けがシグナル)
-        l2up, l2dn = _cross_flag(c_, bbl)   # -2σ
-        maup, madn = _cross_flag(c_, ma25)  # 25MA
-        sarup,sardn= _cross_flag(c_, sar)   # SAR
+        u2up, u2dn = _cross_flag(c_, bbu)    # +2σ
+        u1up, u1dn = _cross_flag(c_, sig1u)  # +1σ
+        l1up, l1dn = _cross_flag(c_, sig1l)  # -1σ
+        l2up, l2dn = _cross_flag(c_, bbl)    # -2σ
+        maup, madn = _cross_flag(c_, ma25)   # 25MA
+        sarup,sardn= _cross_flag(c_, sar)    # SAR
 
-        # トレンド列テキスト（複数シグナルを当日まとめる）
         def _trend_str(i):
             up_sigs, dn_sigs = [], []
             if u2up.iloc[i]:  up_sigs.append("◎+2σ↑")
@@ -862,7 +851,6 @@ def render_technical_section(code, info, col_hex, period_days):
             return " ".join(parts) if parts else ""
 
         Pa_asc["トレンド"] = [_trend_str(i) for i in range(len(Pa_asc))]
-        # 行カラーリング用フラグ
         Pa_asc["TR_up"] = u2up | u1up | maup | sarup
         Pa_asc["TR_dn"] = l2dn | l1dn | madn | sardn
     else:
