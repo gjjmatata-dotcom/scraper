@@ -778,7 +778,6 @@ def render_technical_section(code, info, col_hex, period_days):
 
         Ma = M_chart.sort_values("_dt", ascending=True)
         if period_days > 0:
-            from datetime import timedelta
             cutoff = datetime.today() - timedelta(days=period_days)
             Ma = Ma[Ma["_dt"] >= cutoff].reset_index(drop=True)
 
@@ -808,7 +807,6 @@ def render_technical_section(code, info, col_hex, period_days):
             if not Pa.empty:
                 Pa_chr = Pa.sort_values("_dt", ascending=True)
                 if period_days > 0:
-                    from datetime import timedelta
                     cutoff2 = datetime.today() - timedelta(days=period_days)
                     Pa_chr = Pa_chr[Pa_chr["_dt"] >= cutoff2]
                 if not Pa_chr.empty:
