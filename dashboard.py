@@ -769,6 +769,87 @@ def render_technical_section(code, info, col_hex, period_days):
     fig_base(fig3,420+130*len(sub_inds))
     st.plotly_chart(fig3,use_container_width=True)
 
+    # ── 週次信用残チャート（株価と重畳）─────────────
+    M_chart = info.get("margin", pd.DataFrame())
+    if not M_chart.empty:
+        st.markdown("**📊 週次信用残 × 株価 連動チャート**")
+        st.caption("買い残・売り残（左軸）と株価（右軸）を重ねて表示。"
+                   "信用倍率・買い残増減率も下段に表示。")
+
+        Ma = M_chart.sort_values("_dt", ascending=True)
+        if period_days > 0:
+            from datetime import timedelta
+            cutoff = datetime.today() - timedelta(days=period_days)
+            Ma = Ma[Ma["_dt"] >= cutoff].reset_index(drop=True)
+
+        if not Ma.empty and "日付" in Ma.columns:
+            fig_m = make_subplots(
+                rows=2, cols=1, shared_xaxes=True,
+                row_heights=[0.6, 0.4], vertical_spacing=0.04,
+                subplot_titles=["買い残高・売り残高 ＋ 株価（右軸）",
+                                "信用倍率 / 買い残増減率"],
+                specs=[[{"secondary_y": True}],[{"secondary_y": False}]])
+
+            # 買い残・売り残
+            fig_m.add_trace(go.Scatter(
+                x=Ma["日付"], y=Ma["買い残高"], name="買い残高",
+                line=dict(color="#388bfd", width=2),
+                fill="tozeroy", fillcolor="rgba(56,139,253,0.1)",
+                hovertemplate="%{x}<br>買い残高:%{y:,.0f}<extra></extra>"),
+                row=1, col=1, secondary_y=False)
+            fig_m.add_trace(go.Scatter(
+                x=Ma["日付"], y=Ma["売り残高"], name="売り残高",
+                line=dict(color="#f85149", width=2),
+                fill="tozeroy", fillcolor="rgba(248,81,73,0.1)",
+                hovertemplate="%{x}<br>売り残高:%{y:,.0f}<extra></extra>"),
+                row=1, col=1, secondary_y=False)
+
+            # 株価を右軸に重ねる
+            if not Pa.empty:
+                Pa_chr = Pa.sort_values("_dt", ascending=True)
+                if period_days > 0:
+                    from datetime import timedelta
+                    cutoff2 = datetime.today() - timedelta(days=period_days)
+                    Pa_chr = Pa_chr[Pa_chr["_dt"] >= cutoff2]
+                if not Pa_chr.empty:
+                    fig_m.add_trace(go.Scatter(
+                        x=Pa_chr["日付"], y=Pa_chr["終値"], name="株価",
+                        line=dict(color="#e3b341", width=1.5, dash="dot"),
+                        hovertemplate="%{x}<br>¥%{y:,.1f}<extra></extra>"),
+                        row=1, col=1, secondary_y=True)
+                    fig_m.update_yaxes(title_text="株価", secondary_y=True,
+                        tickfont=dict(color="#e3b341", size=9),
+                        tickformat=",", row=1, col=1)
+
+            # 信用倍率
+            if "信用倍率" in Ma.columns:
+                fig_m.add_trace(go.Scatter(
+                    x=Ma["日付"], y=Ma["信用倍率"], name="信用倍率",
+                    mode="lines+markers",
+                    line=dict(color="#e3b341", width=2),
+                    marker=dict(size=5),
+                    hovertemplate="%{x}<br>信用倍率:%{y:.2f}倍<extra></extra>"),
+                    row=2, col=1)
+                fig_m.add_hline(y=1.0, line_dash="dash", line_color="#f85149",
+                    annotation_text="1倍", annotation_font_color="#f85149",
+                    row=2, col=1)
+                fig_m.add_hline(y=2.0, line_dash="dot", line_color="#e3b341",
+                    annotation_text="2倍", annotation_font_color="#e3b341",
+                    row=2, col=1)
+
+            # 買い残増減率
+            if "買い残増減率" in Ma.columns:
+                chg_colors = ["#3fb950" if v >= 0 else "#f85149"
+                              for v in Ma["買い残増減率"].fillna(0)]
+                fig_m.add_trace(go.Bar(
+                    x=Ma["日付"], y=Ma["買い残増減率"],
+                    name="買い残増減率%", marker_color=chg_colors, opacity=0.6,
+                    hovertemplate="%{x}<br>買い残増減:%{y:+.2f}%<extra></extra>"),
+                    row=2, col=1)
+
+            fig_base(fig_m, 420)
+            st.plotly_chart(fig_m, use_container_width=True)
+
     # ── 株価テーブル ───────────────────────────────
     st.markdown("**📋 株価テーブル**")
 
@@ -857,6 +938,19 @@ def render_technical_section(code, info, col_hex, period_days):
         Pa_asc["トレンド"] = ""
         Pa_asc["TR_up"] = False
         Pa_asc["TR_dn"] = False
+
+    # ── SAR乖離率（表示期間ベース） ──────────────────
+    if "SAR" in Pa_asc.columns and "終値" in Pa_asc.columns:
+        Pa_asc["SAR_dev"] = ((Pa_asc["終値"] - Pa_asc["SAR"])
+                             / Pa_asc["終値"] * 100).round(2)
+    else:
+        Pa_asc["SAR_dev"] = float("nan")
+
+    # ── MACD_hist前日差（表示期間ベース） ────────────
+    if "MACD_hist" in Pa_asc.columns:
+        Pa_asc["MACD_hist_chg"] = Pa_asc["MACD_hist"].diff().round(2)
+    else:
+        Pa_asc["MACD_hist_chg"] = float("nan")
 
     # ══ ローソク足記号（日中幅 2倍超の日のみ） ══════
     def _candle_symbol(row) -> str:

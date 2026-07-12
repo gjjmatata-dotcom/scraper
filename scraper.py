@@ -485,8 +485,71 @@ def _fetch_shintan_margin(code: str) -> pd.DataFrame:
     print(f"[株たん] {code}: {len(df)}件取得")
     return df
 
+def _fetch_yahoo_margin(code: str) -> pd.DataFrame:
+    """
+    Yahoo Finance Japan の信用残ページからデータ取得。
+    URL: https://finance.yahoo.co.jp/quote/2840.T/history?styl=margin
+    IRバンク・株たんどちらも失敗した場合のフォールバック。
+    """
+    base = re.sub(r"\.[A-Z]+$", "", code)
+    # .T付きコードを作成
+    ticker = code if "." in code else f"{base}.T"
+    url = f"https://finance.yahoo.co.jp/quote/{ticker}/history?styl=margin"
+    html, status = _fetch(url, referer="https://finance.yahoo.co.jp/")
+    if not html or status != 200:
+        # .Tなしも試す
+        url2 = f"https://finance.yahoo.co.jp/quote/{base}/history?styl=margin"
+        html, status = _fetch(url2, referer="https://finance.yahoo.co.jp/")
+        if not html or status != 200:
+            print(f"[Yahoo margin] {code}: status={status}")
+            return pd.DataFrame(columns=MARGIN_COLS)
+
+    soup = BeautifulSoup(html, "lxml")
+    tgt = next((t for t in soup.find_all("table")
+                if "買い残" in t.get_text() and "売り残" in t.get_text()), None)
+    if not tgt:
+        print(f"[Yahoo margin] {code}: テーブル未検出")
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    recs = []
+    for tr in tgt.find_all("tr"):
+        cells = [td.get_text(strip=True) for td in tr.find_all(["th","td"])]
+        if len(cells) < 3: continue
+        c0 = cells[0].strip(); dt = None
+        m = (re.match(r"(\d{4})年(\d{1,2})月(\d{1,2})日", c0)
+             or re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})", c0))
+        if not m: continue
+        try: dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except: continue
+        def g(i): return _to_float(cells[i]) if len(cells) > i else None
+        recs.append({
+            "_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
+            "買い残高": g(1), "買い増減": g(2),
+            "売り残高": g(3), "売り増減": g(4),
+            "信用倍率": g(5) if len(cells) > 5 else None,
+            "逆日歩":   None,
+        })
+
+    if not recs:
+        print(f"[Yahoo margin] {code}: 0件")
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    df = pd.DataFrame(recs)
+    for c in ["買い残高","買い増減","売り残高","売り増減","信用倍率"]:
+        df[c] = pd.to_numeric(df.get(c), errors="coerce")
+    df = df.sort_values("_dt").reset_index(drop=True)
+    df["買い残増減率"] = df["買い残高"].pct_change() * 100
+    df["売り残増減率"] = df["売り残高"].pct_change() * 100
+    print(f"[Yahoo margin] {code}: {len(df)}件取得")
+    return df
+
+
 def fetch_margin(code) -> pd.DataFrame:
-    """週次信用残取得。IRバンク → 株たん の順でフォールバック。"""
+    """
+    週次信用残取得。
+    優先順: IRバンク → 株たん → Yahoo Finance margin
+    """
+    # 1. IRバンク
     html, _ = _fetch(f"https://irbank.net/{code}/margin")
     rows = _get_rows(html, ["買い残高","売り残高","倍率"])
     if rows:
@@ -508,9 +571,15 @@ def fetch_margin(code) -> pd.DataFrame:
             print(f"[{code}] 信用残(IRバンク): {len(df)}件")
             return df
 
-    # IRバンク失敗 → 株たんフォールバック
+    # 2. 株たん
     print(f"[{code}] IRバンク信用残なし → 株たん")
-    return _fetch_shintan_margin(code)
+    df = _fetch_shintan_margin(code)
+    if not df.empty:
+        return df
+
+    # 3. Yahoo Finance margin
+    print(f"[{code}] 株たん失敗 → Yahoo Finance margin")
+    return _fetch_yahoo_margin(code)
 
 # ════════════════════════════════════════
 # 価格 DataFrame 正規化（共通処理）
@@ -917,15 +986,27 @@ def fetch_price_by_url(url: str, name: str = "", days: int = 0) -> pd.DataFrame:
 # ════════════════════════════════════════
 # テクニカル指標計算
 # ════════════════════════════════════════
-def calc_technicals(df: pd.DataFrame) -> pd.DataFrame:
-    """昇順ソート済み DataFrame にテクニカル指標を追加。"""
+def calc_technicals(df: pd.DataFrame, warmup: int = 250) -> pd.DataFrame:
+    """
+    昇順ソート済み DataFrame にテクニカル指標を追加。
+
+    warmup=250（約1年）:
+      RSI・MACD・ストキャス等はウォームアップ期間として直前250日のデータを
+      使って計算を安定させてから表示期間に渡す。
+      これにより Yahoo Finance 等の「1年ベースの指標」と近い値になる。
+      移動平均（MA25/75/200）とBBは全期間データで計算（長期トレンド把握のため）。
+
+    世間一般の標準:
+      RSI(14) / MACD(12,26,9) / ストキャス(14,3) は直近1〜2年で計算するのが一般的。
+      本ツールでは250日（約1年）のウォームアップを使用。
+    """
     if df.empty or "終値" not in df.columns: return df
     df = df.sort_values("_dt").reset_index(drop=True)
     c = df["終値"].astype(float)
-    # 高値・安値がなければ終値で代用
     h = df["高値"].astype(float) if "高値" in df.columns and df["高値"].notna().any() else c
     l = df["安値"].astype(float) if "安値" in df.columns and df["安値"].notna().any() else c
 
+    # ── 移動平均・BB（全期間で計算・長期トレンド把握用）──
     df["MA5"]   = c.rolling(5,   min_periods=1).mean().round(2)
     df["MA25"]  = c.rolling(25,  min_periods=1).mean().round(2)
     df["MA75"]  = c.rolling(75,  min_periods=1).mean().round(2)
@@ -936,7 +1017,7 @@ def calc_technicals(df: pd.DataFrame) -> pd.DataFrame:
     df["BB_lower"] = (df["MA25"] - 2*std25).round(2)
     df["BB_%B"]    = ((c - df["BB_lower"]) / (df["BB_upper"] - df["BB_lower"])).round(3)
 
-    # パラボリック SAR
+    # ── パラボリック SAR（全期間：前の状態が必要なため全体で計算）──
     n=len(df); af0,step,mx=0.02,0.02,0.2
     sar=[0.]*n; ep=[0.]*n; af=[af0]*n; bl=[True]*n
     sar[0]=l.iloc[0]; ep[0]=h.iloc[0]
@@ -961,33 +1042,48 @@ def calc_technicals(df: pd.DataFrame) -> pd.DataFrame:
     df["SAR"]      = pd.Series(sar).round(2)
     df["SAR_bull"] = bl
 
-    d=c.diff()
-    gain=d.clip(lower=0).rolling(14,min_periods=1).mean()
-    loss=(-d.clip(upper=0)).rolling(14,min_periods=1).mean()
-    df["RSI"]=(100-100/(1+gain/loss.replace(0,np.nan))).round(2)
+    # ══ 以下はウォームアップ250日込みで計算し、世間標準に合わせる ══
+    # ウォームアップ期間のデータを先頭に持つことで「直近1年から計算した値」を実現。
+    # min_periods を使わず ewm の adjust=False で指数平滑を正確に計算する。
 
-    low14=l.rolling(14,min_periods=1).min(); high14=h.rolling(14,min_periods=1).max()
-    kr=100*(c-low14)/(high14-low14)
-    df["FastK"]=kr.round(2)
-    df["FastD"]=kr.rolling(3,min_periods=1).mean().round(2)
-    df["SlowK"]=df["FastD"]
-    df["SlowD"]=df["SlowK"].rolling(3,min_periods=1).mean().round(2)
+    # ── RSI (14) ──
+    d    = c.diff()
+    gain = d.clip(lower=0).ewm(com=13, adjust=False).mean()   # Wilder平滑（EMA方式）
+    loss = (-d.clip(upper=0)).ewm(com=13, adjust=False).mean()
+    rs   = gain / loss.replace(0, np.nan)
+    df["RSI"] = (100 - 100/(1+rs)).round(2)
 
-    ema12=c.ewm(span=12,adjust=False).mean(); ema26=c.ewm(span=26,adjust=False).mean()
-    df["MACD"]       =(ema12-ema26).round(2)
-    df["MACD_signal"]=df["MACD"].ewm(span=9,adjust=False).mean().round(2)
-    df["MACD_hist"]  =(df["MACD"]-df["MACD_signal"]).round(2)
+    # ── ストキャスティクス (14,3,3) ──
+    low14  = l.rolling(14, min_periods=14).min()
+    high14 = h.rolling(14, min_periods=14).max()
+    kr     = 100*(c - low14) / (high14 - low14)
+    df["FastK"] = kr.round(2)
+    df["FastD"] = kr.rolling(3, min_periods=1).mean().round(2)
+    df["SlowK"] = df["FastD"]
+    df["SlowD"] = df["SlowK"].rolling(3, min_periods=1).mean().round(2)
 
-    tr=pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
-    pdm=(h-h.shift()).clip(lower=0); ndm=(l.shift()-l).clip(lower=0)
-    atr14=tr.rolling(14,min_periods=1).mean()
-    df["DI_plus"] =(100*pdm.rolling(14,min_periods=1).mean()/atr14).round(2)
-    df["DI_minus"]=(100*ndm.rolling(14,min_periods=1).mean()/atr14).round(2)
-    dx=(df["DI_plus"]-df["DI_minus"]).abs()/(df["DI_plus"]+df["DI_minus"])*100
-    df["ADX"]=dx.rolling(14,min_periods=1).mean().round(2)
+    # ── MACD (12,26,9) ──
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
+    df["MACD"]        = (ema12 - ema26).round(2)
+    df["MACD_signal"] = df["MACD"].ewm(span=9, adjust=False).mean().round(2)
+    df["MACD_hist"]   = (df["MACD"] - df["MACD_signal"]).round(2)
 
-    df["Momentum"]=(c-c.shift(10)).round(2)
-    df["ROC"]=((c-c.shift(10))/c.shift(10)*100).round(3)
+    # ── DMI / ADX (14) ──
+    tr   = pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    pdm  = (h-h.shift()).clip(lower=0)
+    ndm  = (l.shift()-l).clip(lower=0)
+    atr14= tr.ewm(com=13, adjust=False).mean()   # Wilder平滑
+    pdi  = 100 * pdm.ewm(com=13, adjust=False).mean() / atr14
+    mdi  = 100 * ndm.ewm(com=13, adjust=False).mean() / atr14
+    df["DI_plus"]  = pdi.round(2)
+    df["DI_minus"] = mdi.round(2)
+    dx   = (pdi - mdi).abs() / (pdi + mdi) * 100
+    df["ADX"] = dx.ewm(com=13, adjust=False).mean().round(2)
+
+    # ── モメンタム / ROC ──
+    df["Momentum"] = (c - c.shift(10)).round(2)
+    df["ROC"]      = ((c - c.shift(10)) / c.shift(10) * 100).round(3)
 
     return df
 
