@@ -431,29 +431,65 @@ def fetch_lending(code) -> pd.DataFrame:
     print(f"[{code}] 貸借: {len(df)}行")
     return df
 
+def _detect_margin_col_map(header_cells) -> dict:
+    """
+    信用残テーブルのヘッダー行テキストから列インデックスを動的に判定する。
+    サイト（株たん／Yahoo Finance）によって列の並び順が異なるため、
+    固定インデックス決め打ちではなく見出し文字列から都度判定する。
+    """
+    idx = {"買残高": None, "買増減": None, "売残高": None, "売増減": None, "倍率": None}
+    for i, txt in enumerate(header_cells):
+        t = txt.replace(" ", "")
+        is_buy  = "買" in t
+        is_sell = "売" in t
+        is_chg  = ("増減" in t) or ("前週比" in t) or ("前日比" in t)
+        is_rate = "倍率" in t
+        if is_rate and idx["倍率"] is None:
+            idx["倍率"] = i
+        elif is_buy and is_chg and idx["買増減"] is None:
+            idx["買増減"] = i
+        elif is_sell and is_chg and idx["売増減"] is None:
+            idx["売増減"] = i
+        elif is_buy and idx["買残高"] is None:
+            idx["買残高"] = i
+        elif is_sell and idx["売残高"] is None:
+            idx["売残高"] = i
+    return idx
+
 def _fetch_shintan_margin(code: str) -> pd.DataFrame:
     """
-    株たん (https://kabutan.jp/stock/finance?code=XXXX) の信用残データを取得。
+    株たん (https://kabutan.jp/stock/kabuka?code=XXXX&ashi=shin) の
+    「週次信用残時系列データ」ページから信用残データを取得。
     IRバンクで取得できない場合のフォールバック。
+    ※ finance?code=XXXX は決算・財務ページであり信用残データは載っていないため誤り。
     """
     # 4桁コードに正規化（1570.T → 1570）
     base = re.sub(r"\.[A-Z]+$", "", code)
-    url  = f"https://kabutan.jp/stock/finance?code={base}"
+    url  = f"https://kabutan.jp/stock/kabuka?code={base}&ashi=shin"
     html, status = _fetch(url, referer="https://kabutan.jp/")
     if not html or status != 200:
         print(f"[株たん] {code}: status={status}")
         return pd.DataFrame(columns=MARGIN_COLS)
 
     soup = BeautifulSoup(html, "lxml")
-    # 信用残テーブルを探す（「買い残」「売り残」を含む表）
+    # 信用残テーブルを探す（「買」「売」「残」を含む表。「買い残」「買残」どちらの表記にも対応）
     tgt = next((t for t in soup.find_all("table")
-                if "買い残" in t.get_text() and "売り残" in t.get_text()), None)
+                if "買" in t.get_text() and "売" in t.get_text() and "残" in t.get_text()), None)
     if not tgt:
         print(f"[株たん] {code}: 信用残テーブル未検出")
         return pd.DataFrame(columns=MARGIN_COLS)
 
+    rows = tgt.find_all("tr")
+    if not rows:
+        print(f"[株たん] {code}: データ0件")
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    # ヘッダー行から列インデックスを動的判定
+    header_cells = [c.get_text(strip=True) for c in rows[0].find_all(["th","td"])]
+    cmap = _detect_margin_col_map(header_cells)
+
     recs = []
-    for tr in tgt.find_all("tr"):
+    for tr in rows[1:]:
         cells = [td.get_text(strip=True) for td in tr.find_all(["th","td"])]
         if len(cells) < 4: continue
         # 日付列を探す（YYYY/MM/DD または MM/DD形式）
@@ -463,12 +499,12 @@ def _fetch_shintan_margin(code: str) -> pd.DataFrame:
         if not m: continue
         try: dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except: continue
-        def g(i): return _to_float(cells[i]) if len(cells) > i else None
+        def g(i): return _to_float(cells[i]) if i is not None and len(cells) > i else None
         recs.append({
             "_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
-            "買い残高": g(1), "買い増減": g(2),
-            "売り残高": g(3), "売り増減": g(4),
-            "信用倍率": g(5) if len(cells) > 5 else None,
+            "買い残高": g(cmap["買残高"]), "買い増減": g(cmap["買増減"]),
+            "売り残高": g(cmap["売残高"]), "売り増減": g(cmap["売増減"]),
+            "信用倍率": g(cmap["倍率"]),
             "逆日歩":   None,
         })
 
@@ -488,31 +524,44 @@ def _fetch_shintan_margin(code: str) -> pd.DataFrame:
 def _fetch_yahoo_margin(code: str) -> pd.DataFrame:
     """
     Yahoo Finance Japan の信用残ページからデータ取得。
-    URL: https://finance.yahoo.co.jp/quote/2840.T/history?styl=margin
+    URL: https://finance.yahoo.co.jp/quote/2840.T/history?styl=margin&page=1
+    （page=1 が無いと株価時系列タブにフォールバックされ、信用残テーブルが
+      取得できないことがあるため明示的に付与する）
     IRバンク・株たんどちらも失敗した場合のフォールバック。
     """
     base = re.sub(r"\.[A-Z]+$", "", code)
     # .T付きコードを作成
     ticker = code if "." in code else f"{base}.T"
-    url = f"https://finance.yahoo.co.jp/quote/{ticker}/history?styl=margin"
+    url = f"https://finance.yahoo.co.jp/quote/{ticker}/history?styl=margin&page=1"
     html, status = _fetch(url, referer="https://finance.yahoo.co.jp/")
     if not html or status != 200:
         # .Tなしも試す
-        url2 = f"https://finance.yahoo.co.jp/quote/{base}/history?styl=margin"
+        url2 = f"https://finance.yahoo.co.jp/quote/{base}/history?styl=margin&page=1"
         html, status = _fetch(url2, referer="https://finance.yahoo.co.jp/")
         if not html or status != 200:
             print(f"[Yahoo margin] {code}: status={status}")
             return pd.DataFrame(columns=MARGIN_COLS)
 
     soup = BeautifulSoup(html, "lxml")
+    # Yahoo Financeの実際の見出しは「売残」「買残」（送り仮名なし）のため「買い残」等での
+    # 完全一致検索では見つからない。「買」「売」「残」の3文字が揃う表を探す方式に修正。
     tgt = next((t for t in soup.find_all("table")
-                if "買い残" in t.get_text() and "売り残" in t.get_text()), None)
+                if "買" in t.get_text() and "売" in t.get_text() and "残" in t.get_text()), None)
     if not tgt:
         print(f"[Yahoo margin] {code}: テーブル未検出")
         return pd.DataFrame(columns=MARGIN_COLS)
 
+    rows = tgt.find_all("tr")
+    if not rows:
+        print(f"[Yahoo margin] {code}: 0件")
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    # ヘッダー行から列インデックスを動的判定（実際の列順は 日付/売残/買残/売残増減/買残増減/信用倍率）
+    header_cells = [c.get_text(strip=True) for c in rows[0].find_all(["th","td"])]
+    cmap = _detect_margin_col_map(header_cells)
+
     recs = []
-    for tr in tgt.find_all("tr"):
+    for tr in rows[1:]:
         cells = [td.get_text(strip=True) for td in tr.find_all(["th","td"])]
         if len(cells) < 3: continue
         c0 = cells[0].strip(); dt = None
@@ -521,12 +570,12 @@ def _fetch_yahoo_margin(code: str) -> pd.DataFrame:
         if not m: continue
         try: dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except: continue
-        def g(i): return _to_float(cells[i]) if len(cells) > i else None
+        def g(i): return _to_float(cells[i]) if i is not None and len(cells) > i else None
         recs.append({
             "_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
-            "買い残高": g(1), "買い増減": g(2),
-            "売り残高": g(3), "売り増減": g(4),
-            "信用倍率": g(5) if len(cells) > 5 else None,
+            "買い残高": g(cmap["買残高"]), "買い増減": g(cmap["買増減"]),
+            "売り残高": g(cmap["売残高"]), "売り増減": g(cmap["売増減"]),
+            "信用倍率": g(cmap["倍率"]),
             "逆日歩":   None,
         })
 
