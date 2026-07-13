@@ -215,6 +215,12 @@ _YF_TICKER_MAP = {
     "^NDX":     "^NDX",
     "^SOX":     "^SOX",
     "NDAQ":     "NDAQ",
+    # S&P500のよくある別表記 → yfinance正式ティッカー(^GSPC)へのエイリアス
+    # ("SPX"はCBOEオプション用シンボルでありyfinanceでは無効なティッカーのため注意)
+    "SPX":      "^GSPC",
+    "SP500":    "^GSPC",
+    "S&P500":   "^GSPC",
+    "GSPC":     "^GSPC",
 }
 
 def _to_yf_ticker(code: str) -> list:
