@@ -11,7 +11,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scraper import (fetch_one, fetch_price_by_url, fetch_price_long,
-                     calc_technicals, STOCKS, _safe_int_fmt)
+                     calc_technicals, STOCKS, _safe_int_fmt, SHORT_TOPN)
 import socket, re, json, os, requests as _requests
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -1042,6 +1042,25 @@ def render_technical_section(code, info, col_hex, period_days):
             return "🟢買い" if b>s else "🔴売り" if s>b else "⚪"
         pt["信用需給"] = Pa_desc2["_dt"].apply(_cs)
 
+        # 機関空売り（nikkeiyosoku.com 増加/減少トップNに該当した日のみトレンド表示）
+        SI_t = info.get("short_inst") or {}
+        S_inc_t = SI_t.get("top_increase", pd.DataFrame())
+        S_dec_t = SI_t.get("top_decrease", pd.DataFrame())
+        if not S_inc_t.empty or not S_dec_t.empty:
+            day_trend = {}  # date -> (向き:+1機関売り優勢/-1機関買い優勢, 取引量絶対値)
+            for _, r in S_inc_t.iterrows():
+                d = r["_dt"].date(); v = abs(r["増減量"])
+                if d not in day_trend or v > day_trend[d][1]: day_trend[d] = (1, v)
+            for _, r in S_dec_t.iterrows():
+                d = r["_dt"].date(); v = abs(r["増減量"])
+                if d not in day_trend or v > day_trend[d][1]: day_trend[d] = (-1, v)
+            def _inst_trend(dt):
+                d = dt.date() if hasattr(dt, "date") else dt
+                t = day_trend.get(d)
+                if not t: return "-"
+                return "🔴機関売り" if t[0] == 1 else "🔵機関買い"
+            pt["機関空売り"] = Pa_desc2["_dt"].apply(_inst_trend)
+
     # SAR乖離%
     if "SAR_dev" in Pa_desc2.columns:
         pt["SAR乖離%"] = Pa_desc2["SAR_dev"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
@@ -1363,6 +1382,54 @@ def render_stock(code, info, col_hex):
             + (f"  ※出来高平均={dv_avg/1e6:.1f}M" if dv_avg else ""))
     else:
         st.info("② 週次信用残データなし")
+
+    # ②-2 機関投資家 空売り情報（nikkeiyosoku.com）
+    SI = info.get("short_inst") or {}
+    S_raw = SI.get("raw", pd.DataFrame())
+    if not S_raw.empty:
+        st.markdown("**②-2 機関投資家 空売り情報**")
+        S_top_inc = SI.get("top_increase", pd.DataFrame())
+        S_top_dec = SI.get("top_decrease", pd.DataFrame())
+        inc_idx = set(S_top_inc.index) if not S_top_inc.empty else set()
+        dec_idx = set(S_top_dec.index) if not S_top_dec.empty else set()
+
+        Sd = S_raw.sort_values("_dt", ascending=False).reset_index(drop=False)
+        ds = pd.DataFrame()
+        ds["計算日"] = Sd["日付"]
+        ds["空売り機関"] = Sd["空売り機関"]
+        ds["残高比率"] = Sd["残高比率"].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "-")
+        ds["増減率差"] = Sd["増減率差"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
+        ds["残高数量"] = Sd["残高数量"].apply(lambda v: f"{v:,.0f}株" if pd.notna(v) else "-")
+        ds["増減量"]   = Sd["増減量"].apply(lambda v: f"{v:+,.0f}" if pd.notna(v) else "-")
+
+        # トップN（増加=赤系, 減少=青系）を行単位でカラーリング
+        def _row_style(row):
+            orig_idx = Sd.loc[row.name, "index"]
+            if orig_idx in inc_idx:
+                return ["background-color:#3a1414;color:#ff6b6b"] * len(row)
+            if orig_idx in dec_idx:
+                return ["background-color:#0f2a3a;color:#6bc7ff"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(ds.style.apply(_row_style, axis=1),
+            use_container_width=True, hide_index=True, height=min(38*(len(ds)+1)+38, 480))
+        st.caption(
+            f"🔴 = 空売り増加トップ{SHORT_TOPN}件（機関の売りトレンド強） / "
+            f"🔵 = 空売り減少（買戻し）トップ{SHORT_TOPN}件（機関の買いトレンド強）  \n"
+            "※nikkeiyosoku.comの「もっと見る」機能はJS描画のためページネーション不可。"
+            "取得できた範囲内でのトップN件を強調表示しています。")
+
+        # 空売り者一覧（残高比率が高い順）
+        by_inst = SI.get("by_institution", pd.DataFrame())
+        if not by_inst.empty:
+            st.markdown("**空売り者一覧（残高比率が高い順・下落圧力の目安）**")
+            di = by_inst.copy()
+            di["残高比率"] = di["残高比率"].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "-")
+            st.dataframe(di[["空売り機関","残高比率","計算日"]],
+                use_container_width=True, hide_index=True,
+                height=min(38*(len(di)+1)+38, 360))
+            st.caption("📌 残高比率が高い機関ほど、その銘柄に対して大きな空売りポジションを維持しています。"
+                       "上位に多くの機関・高い比率が並ぶほど、潜在的な下落圧力（買戻しによる反発リスクも含む）が高いと解釈できます。")
 
     # ③ テクニカル分析
     render_technical_section(code,info,col_hex,period_days)

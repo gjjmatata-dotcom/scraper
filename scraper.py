@@ -402,6 +402,103 @@ LEND_COLS=["_dt","申込日","買い残高","買い増減","買い新規","買�
 MARGIN_COLS=["_dt","日付","買い残高","買い増減","売り残高","売り増減",
              "信用倍率","逆日歩","買い残増減率","売り残増減率"]
 
+# ════════════════════════════════════════
+# 機関投資家 空売り残高情報 (nikkeiyosoku.com)
+# ════════════════════════════════════════
+SHORT_COLS = ["_dt","日付","空売り機関","残高比率","増減率差","残高数量","増減量"]
+SHORT_TOPN = 3   # ページネーション不可のため取得できる範囲内でトップ3件を強調表示対象とする
+
+def _parse_short_selling_table(html: str) -> pd.DataFrame:
+    soup = BeautifulSoup(html, "lxml")
+    tgt = next((t for t in soup.find_all("table")
+                if "空売り機関" in t.get_text() and "増減量" in t.get_text()), None)
+    if not tgt:
+        return pd.DataFrame(columns=SHORT_COLS)
+
+    rows = tgt.find_all("tr")
+    if len(rows) < 2:
+        return pd.DataFrame(columns=SHORT_COLS)
+
+    today = datetime.today()
+    recs = []
+    for tr in rows[1:]:
+        cells = [td.get_text(strip=True) for td in tr.find_all(["th","td"])]
+        if len(cells) < 6: continue
+        m = re.match(r"(\d{1,2})/(\d{1,2})", cells[0].strip())
+        if not m: continue
+        mo, da = int(m.group(1)), int(m.group(2))
+        # 年が明示されないため、未来日になる場合は前年とみなす
+        year = today.year
+        try:
+            dt = datetime(year, mo, da)
+            if dt > today:
+                dt = datetime(year - 1, mo, da)
+        except ValueError:
+            continue
+        inst = cells[1].strip()
+        ratio = _to_float(cells[2].replace("%",""))
+        diff  = _to_float(cells[3].replace("%",""))
+        qty   = _to_float(cells[4].replace("株","").replace(",",""))
+        chg   = _to_float(cells[5].replace(",",""))
+        recs.append({"_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
+                     "空売り機関": inst, "残高比率": ratio, "増減率差": diff,
+                     "残高数量": qty, "増減量": chg})
+
+    if not recs:
+        return pd.DataFrame(columns=SHORT_COLS)
+    df = pd.DataFrame(recs)
+    for c in ["残高比率","増減率差","残高数量","増減量"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.sort_values("_dt").reset_index(drop=True)
+
+
+def fetch_institutional_short(code: str) -> dict:
+    """
+    nikkeiyosoku.com の空売り機関別データを取得する。
+    URL: ETFは /stock_etf/short/{code}/ 、個別株は /stock/short/{code}/
+    「もっと見る」はJS描画のためページネーション不可 → 取得できた範囲内で
+    増加トップ{SHORT_TOPN}件・減少トップ{SHORT_TOPN}件を強調表示対象として算出する。
+
+    戻り値:
+      raw          : 取得した全行（日付昇順）
+      top_increase : 増減量が多い(プラス)上位N件
+      top_decrease : 増減量が少ない(マイナス)上位N件
+      by_institution: 機関ごとの最新の残高比率で降順ソートした一覧
+    """
+    base = re.sub(r"\.[A-Z]+$", "", code)
+    empty = {"raw": pd.DataFrame(columns=SHORT_COLS),
+             "top_increase": pd.DataFrame(columns=SHORT_COLS),
+             "top_decrease": pd.DataFrame(columns=SHORT_COLS),
+             "by_institution": pd.DataFrame(columns=["空売り機関","残高比率","計算日"])}
+
+    df = pd.DataFrame(columns=SHORT_COLS)
+    for path in ("stock_etf", "stock"):
+        url = f"https://nikkeiyosoku.com/{path}/short/{base}/"
+        html, status = _fetch(url, referer="https://nikkeiyosoku.com/")
+        if html and status == 200:
+            df = _parse_short_selling_table(html)
+            if not df.empty:
+                break
+
+    if df.empty:
+        print(f"[機関空売り] {code}: データ0件")
+        return empty
+
+    top_increase = df[df["増減量"] > 0].nlargest(SHORT_TOPN, "増減量")
+    top_decrease = df[df["増減量"] < 0].nsmallest(SHORT_TOPN, "増減量")
+
+    by_inst = (df.sort_values("_dt")
+                 .groupby("空売り機関", as_index=False)
+                 .last()[["空売り機関","残高比率","日付"]]
+                 .rename(columns={"日付":"計算日"})
+                 .sort_values("残高比率", ascending=False)
+                 .reset_index(drop=True))
+
+    print(f"[機関空売り] {code}: {len(df)}件取得 (増加TOP{len(top_increase)}/減少TOP{len(top_decrease)})")
+    return {"raw": df, "top_increase": top_increase, "top_decrease": top_decrease,
+            "by_institution": by_inst}
+
+
 def _fetch_irbank_lending(code) -> pd.DataFrame:
     html,_=_fetch(f"https://irbank.net/{code}/nisshokin")
     rows=_get_rows(html,["買い残高","売り残高","倍率"])
@@ -527,26 +624,12 @@ def _fetch_shintan_margin(code: str) -> pd.DataFrame:
     print(f"[株たん] {code}: {len(df)}件取得")
     return df
 
-def _fetch_yahoo_margin(code: str) -> pd.DataFrame:
-    """
-    Yahoo Finance Japan の信用残ページからデータ取得。
-    URL: https://finance.yahoo.co.jp/quote/2840.T/history?styl=margin&page=1
-    （page=1 が無いと株価時系列タブにフォールバックされ、信用残テーブルが
-      取得できないことがあるため明示的に付与する）
-    IRバンク・株たんどちらも失敗した場合のフォールバック。
-    """
-    base = re.sub(r"\.[A-Z]+$", "", code)
-    # .T付きコードを作成
-    ticker = code if "." in code else f"{base}.T"
-    url = f"https://finance.yahoo.co.jp/quote/{ticker}/history?styl=margin&page=1"
+def _fetch_yahoo_margin_page(ticker: str, page: int) -> pd.DataFrame:
+    """Yahoo Finance信用残ページの1ページ分を取得してDataFrameで返す（内部用）。"""
+    url = f"https://finance.yahoo.co.jp/quote/{ticker}/history?styl=margin&page={page}"
     html, status = _fetch(url, referer="https://finance.yahoo.co.jp/")
     if not html or status != 200:
-        # .Tなしも試す
-        url2 = f"https://finance.yahoo.co.jp/quote/{base}/history?styl=margin&page=1"
-        html, status = _fetch(url2, referer="https://finance.yahoo.co.jp/")
-        if not html or status != 200:
-            print(f"[Yahoo margin] {code}: status={status}")
-            return pd.DataFrame(columns=MARGIN_COLS)
+        return pd.DataFrame(columns=MARGIN_COLS), status
 
     soup = BeautifulSoup(html, "lxml")
     # Yahoo Financeの実際の見出しは「売残」「買残」（送り仮名なし）のため「買い残」等での
@@ -554,13 +637,11 @@ def _fetch_yahoo_margin(code: str) -> pd.DataFrame:
     tgt = next((t for t in soup.find_all("table")
                 if "買" in t.get_text() and "売" in t.get_text() and "残" in t.get_text()), None)
     if not tgt:
-        print(f"[Yahoo margin] {code}: テーブル未検出")
-        return pd.DataFrame(columns=MARGIN_COLS)
+        return pd.DataFrame(columns=MARGIN_COLS), status
 
     rows = tgt.find_all("tr")
     if not rows:
-        print(f"[Yahoo margin] {code}: 0件")
-        return pd.DataFrame(columns=MARGIN_COLS)
+        return pd.DataFrame(columns=MARGIN_COLS), status
 
     # ヘッダー行から列インデックスを動的判定（実際の列順は 日付/売残/買残/売残増減/買残増減/信用倍率）
     header_cells = [c.get_text(strip=True) for c in rows[0].find_all(["th","td"])]
@@ -584,26 +665,73 @@ def _fetch_yahoo_margin(code: str) -> pd.DataFrame:
             "信用倍率": g(cmap["倍率"]),
             "逆日歩":   None,
         })
+    return pd.DataFrame(recs), status
 
-    if not recs:
-        print(f"[Yahoo margin] {code}: 0件")
+
+def _fetch_yahoo_margin(code: str, pages: int = 2) -> pd.DataFrame:
+    """
+    Yahoo Finance Japan の信用残ページからデータ取得。
+    URL例: https://finance.yahoo.co.jp/quote/2840.T/history?styl=margin&page=1
+           https://finance.yahoo.co.jp/quote/2840.T/history?styl=margin&page=2
+    （page= が無いと株価時系列タブにフォールバックされ、信用残テーブルが
+      取得できないことがあるため明示的に付与する）
+    1ページ目だけでは最新〜数週間分しか載らないため、page=1〜pages(既定2)まで
+    取得してマージすることで、より広い期間・より新しい行を確実に拾う。
+    IRバンクのデータが無い、または古すぎる場合のフォールバック。
+    """
+    base = re.sub(r"\.[A-Z]+$", "", code)
+    ticker = code if "." in code else f"{base}.T"
+
+    frames = []
+    for page in range(1, pages + 1):
+        df_p, status = _fetch_yahoo_margin_page(ticker, page)
+        if df_p.empty and status != 200:
+            # .Tなしのコードでも試す（1ページ目失敗時のみ）
+            if page == 1:
+                df_p, status = _fetch_yahoo_margin_page(base, page)
+            if df_p.empty:
+                print(f"[Yahoo margin] {code} page={page}: status={status}")
+                break
+        if df_p.empty:
+            print(f"[Yahoo margin] {code} page={page}: 0件（打ち切り）")
+            break
+        frames.append(df_p)
+        time.sleep(0.3)  # 連続アクセス間隔を空ける
+
+    if not frames:
         return pd.DataFrame(columns=MARGIN_COLS)
 
-    df = pd.DataFrame(recs)
+    df = pd.concat(frames, ignore_index=True)
+    df = df.drop_duplicates("_dt", keep="first").sort_values("_dt").reset_index(drop=True)
     for c in ["買い残高","買い増減","売り残高","売り増減","信用倍率"]:
         df[c] = pd.to_numeric(df.get(c), errors="coerce")
-    df = df.sort_values("_dt").reset_index(drop=True)
     df["買い残増減率"] = df["買い残高"].pct_change() * 100
     df["売り残増減率"] = df["売り残高"].pct_change() * 100
-    print(f"[Yahoo margin] {code}: {len(df)}件取得")
+    print(f"[Yahoo margin] {code}: {len(df)}件取得（{len(frames)}ページ分）")
     return df
 
+
+MARGIN_STALE_DAYS = 14  # この日数より最新データが古い場合は「更新停止」とみなす
+
+def _merge_margin(df_base: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFrame:
+    """日付でマージし、重複日は新しく取得した方(df_new)を優先する。"""
+    if df_base.empty: return df_new
+    if df_new.empty:  return df_base
+    merged = pd.concat([df_base, df_new], ignore_index=True)
+    merged = merged.drop_duplicates("_dt", keep="last").sort_values("_dt").reset_index(drop=True)
+    merged["買い残増減率"] = merged["買い残高"].pct_change() * 100
+    merged["売り残増減率"] = merged["売り残高"].pct_change() * 100
+    return merged
 
 def fetch_margin(code) -> pd.DataFrame:
     """
     週次信用残取得。
-    優先順: IRバンク → 株たん → Yahoo Finance margin
+    優先順: IRバンク → 株たん → Yahoo Finance margin(page1-2)
+    IRバンクにデータがあっても、最新日付が MARGIN_STALE_DAYS 日より古い場合は
+    「更新が止まっている」とみなし、株たん/Yahooから新しい行を追加取得してマージする。
     """
+    df_irbank = pd.DataFrame(columns=MARGIN_COLS)
+
     # 1. IRバンク
     html, _ = _fetch(f"https://irbank.net/{code}/margin")
     rows = _get_rows(html, ["買い残高","売り残高","倍率"])
@@ -617,24 +745,46 @@ def fetch_margin(code) -> pd.DataFrame:
                     "逆日歩":_parse_yaku(row[6]) if len(row)>6 else None}
         recs = _parse_irbank_rows(rows, 4, mapper)
         if recs:
-            df = pd.DataFrame(recs)
+            df_irbank = pd.DataFrame(recs)
             for c in ["買い残高","買い増減","売り残高","売り増減","信用倍率","逆日歩"]:
-                df[c] = pd.to_numeric(df.get(c), errors="coerce")
-            df = df.sort_values("_dt").reset_index(drop=True)
-            df["買い残増減率"] = df["買い残高"].pct_change() * 100
-            df["売り残増減率"] = df["売り残高"].pct_change() * 100
-            print(f"[{code}] 信用残(IRバンク): {len(df)}件")
+                df_irbank[c] = pd.to_numeric(df_irbank.get(c), errors="coerce")
+            df_irbank = df_irbank.sort_values("_dt").reset_index(drop=True)
+            df_irbank["買い残増減率"] = df_irbank["買い残高"].pct_change() * 100
+            df_irbank["売り残増減率"] = df_irbank["売り残高"].pct_change() * 100
+            print(f"[{code}] 信用残(IRバンク): {len(df_irbank)}件")
+
+    if df_irbank.empty:
+        # IRバンクに1件もない → 株たん → Yahoo の順で試す
+        print(f"[{code}] IRバンク信用残なし → 株たん")
+        df = _fetch_shintan_margin(code)
+        if not df.empty:
             return df
+        print(f"[{code}] 株たん失敗 → Yahoo Finance margin")
+        return _fetch_yahoo_margin(code)
 
-    # 2. 株たん
-    print(f"[{code}] IRバンク信用残なし → 株たん")
-    df = _fetch_shintan_margin(code)
-    if not df.empty:
-        return df
+    # IRバンクにデータはあるが、最新日付の鮮度をチェック
+    latest = df_irbank["_dt"].max()
+    stale_days = (datetime.today() - latest).days
+    if stale_days <= MARGIN_STALE_DAYS:
+        return df_irbank
 
-    # 3. Yahoo Finance margin
-    print(f"[{code}] 株たん失敗 → Yahoo Finance margin")
-    return _fetch_yahoo_margin(code)
+    print(f"[{code}] IRバンク信用残が{stale_days}日更新なし(最新{latest:%Y/%m/%d}) → Yahoo/株たんで補完")
+    df_yahoo = _fetch_yahoo_margin(code)
+    df_merged = _merge_margin(df_irbank, df_yahoo)
+    new_latest = df_merged["_dt"].max()
+    if new_latest > latest:
+        print(f"[{code}] 補完成功: 最新{latest:%Y/%m/%d}→{new_latest:%Y/%m/%d}")
+        return df_merged
+
+    # Yahooでも更新できなければ株たんも試す
+    df_kabutan = _fetch_shintan_margin(code)
+    df_merged2 = _merge_margin(df_irbank, df_kabutan)
+    if df_merged2["_dt"].max() > latest:
+        print(f"[{code}] 株たんで補完成功: 最新{latest:%Y/%m/%d}→{df_merged2['_dt'].max():%Y/%m/%d}")
+        return df_merged2
+
+    print(f"[{code}] Yahoo/株たんいずれも更新なし → IRバンクの{latest:%Y/%m/%d}時点データのまま")
+    return df_irbank
 
 # ════════════════════════════════════════
 # 価格 DataFrame 正規化（共通処理）
@@ -1197,5 +1347,10 @@ def fetch_one(code) -> dict:
     if not p.empty and _code_type(_normalize_jp_code(code)) in ("fund", "index_jp"):
         cache_append(_normalize_jp_code(code), p)
     p_long=fetch_price_long(code, days=0)
+    # 機関投資家 空売り情報（日本株/ETFのみ対象、米国株・投資信託はnikkeiyosoku非対応）
+    if _code_type(_normalize_jp_code(code)) in ("stock_jp", "index_jp") or code.isdigit():
+        short_inst = fetch_institutional_short(code)
+    else:
+        short_inst = None
     return {"name":name,"lending":l,"price":p,"price_long":p_long,
-            "margin":m,"pressure":judge_pressure(l,p)}
+            "margin":m,"pressure":judge_pressure(l,p),"short_inst":short_inst}
