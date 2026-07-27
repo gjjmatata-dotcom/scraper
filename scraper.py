@@ -1347,8 +1347,8 @@ def fetch_one(code) -> dict:
     if not p.empty and _code_type(_normalize_jp_code(code)) in ("fund", "index_jp"):
         cache_append(_normalize_jp_code(code), p)
     p_long=fetch_price_long(code, days=0)
-    # 機関投資家 空売り情報（日本株/ETFのみ対象、米国株・投資信託はnikkeiyosoku非対応）
-    if _code_type(_normalize_jp_code(code)) in ("stock_jp", "index_jp") or code.isdigit():
+    # 機関投資家 空売り情報（nikkeiyosoku.comは日本株/ETFのみ対応。指数・投資信託・米国株は対象外）
+    if _code_type(_normalize_jp_code(code)) == "stock_jp":
         short_inst = fetch_institutional_short(code)
     else:
         short_inst = None

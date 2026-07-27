@@ -1253,6 +1253,16 @@ def render_stock(code, info, col_hex):
     pr=info["pressure"]; prc=PR_COLORS.get(pr["label"],"#8b949e")
     lmb,lms=get_latest_margin_bal(M)
 
+    # 旧バージョンでキャッシュされ short_inst キーを持たない銘柄は、その場で補完取得する
+    if "short_inst" not in info:
+        from scraper import _code_type, _normalize_jp_code, fetch_institutional_short
+        if _code_type(_normalize_jp_code(code)) == "stock_jp":
+            info["short_inst"] = fetch_institutional_short(code)
+        else:
+            info["short_inst"] = None
+        st.session_state.stock_data[code] = info
+
+
     st.markdown(f"""<div style="background:#161b22;border-left:4px solid {prc};
         border-radius:6px;padding:10px 14px;margin-bottom:12px">
       <span style="font-size:1.05rem;font-weight:700;color:{prc}">{pr['label']}</span>
