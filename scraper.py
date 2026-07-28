@@ -668,16 +668,17 @@ def _fetch_yahoo_margin_page(ticker: str, page: int) -> pd.DataFrame:
     return pd.DataFrame(recs), status
 
 
-def _fetch_yahoo_margin(code: str, pages: int = 2) -> pd.DataFrame:
+def _fetch_yahoo_margin(code: str, pages: int = 3) -> pd.DataFrame:
     """
     Yahoo Finance Japan の信用残ページからデータ取得。
-    URL例: https://finance.yahoo.co.jp/quote/2840.T/history?styl=margin&page=1
-           https://finance.yahoo.co.jp/quote/2840.T/history?styl=margin&page=2
+    URL例: https://finance.yahoo.co.jp/quote/1570.T/history?styl=margin&page=1
+           https://finance.yahoo.co.jp/quote/1570.T/history?styl=margin&page=2
+           https://finance.yahoo.co.jp/quote/1570.T/history?styl=margin&page=3
     （page= が無いと株価時系列タブにフォールバックされ、信用残テーブルが
       取得できないことがあるため明示的に付与する）
-    1ページ目だけでは最新〜数週間分しか載らないため、page=1〜pages(既定2)まで
+    1ページ目だけでは最新〜数週間分しか載らないため、page=1〜pages(既定3)まで
     取得してマージすることで、より広い期間・より新しい行を確実に拾う。
-    IRバンクのデータが無い、または古すぎる場合のフォールバック。
+    IRバンクより更新が早いため、週次信用残の第一取得元として使用する。
     """
     base = re.sub(r"\.[A-Z]+$", "", code)
     ticker = code if "." in code else f"{base}.T"
@@ -723,68 +724,70 @@ def _merge_margin(df_base: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFrame:
     merged["売り残増減率"] = merged["売り残高"].pct_change() * 100
     return merged
 
+def _fetch_irbank_margin(code) -> pd.DataFrame:
+    """IRバンクから週次信用残を取得する（内部用・Yahoo取得失敗時の補完に使用）。"""
+    html, _ = _fetch(f"https://irbank.net/{code}/margin")
+    rows = _get_rows(html, ["買い残高","売り残高","倍率"])
+    if not rows:
+        return pd.DataFrame(columns=MARGIN_COLS)
+    def mapper(row, dt):
+        bb,bc=_bal_chg(row[1]) if len(row)>1 else (None,None)
+        sb,sc=_bal_chg(row[3]) if len(row)>3 else (None,None)
+        return {"_dt":dt,"日付":dt.strftime("%Y/%m/%d"),
+                "買い残高":bb,"買い増減":bc,"売り残高":sb,"売り増減":sc,
+                "信用倍率":_to_float(row[5]) if len(row)>5 else None,
+                "逆日歩":_parse_yaku(row[6]) if len(row)>6 else None}
+    recs = _parse_irbank_rows(rows, 4, mapper)
+    if not recs:
+        return pd.DataFrame(columns=MARGIN_COLS)
+    df = pd.DataFrame(recs)
+    for c in ["買い残高","買い増減","売り残高","売り増減","信用倍率","逆日歩"]:
+        df[c] = pd.to_numeric(df.get(c), errors="coerce")
+    df = df.sort_values("_dt").reset_index(drop=True)
+    df["買い残増減率"] = df["買い残高"].pct_change() * 100
+    df["売り残増減率"] = df["売り残高"].pct_change() * 100
+    return df
+
+
 def fetch_margin(code) -> pd.DataFrame:
     """
     週次信用残取得。
-    優先順: IRバンク → 株たん → Yahoo Finance margin(page1-2)
-    IRバンクにデータがあっても、最新日付が MARGIN_STALE_DAYS 日より古い場合は
-    「更新が止まっている」とみなし、株たん/Yahooから新しい行を追加取得してマージする。
+    優先順: Yahoo Finance margin(page1-3) → 株たん → IRバンク
+    IRバンクは更新頻度が低いため、Yahoo Financeを第一取得元に変更。
+    Yahooのデータが取得できても件数が少ない/最新日付が古い場合は、
+    株たん・IRバンクの情報で不足分を補ってマージする。
     """
-    df_irbank = pd.DataFrame(columns=MARGIN_COLS)
+    df_yahoo = _fetch_yahoo_margin(code)  # page 1〜3をマージ済み
 
-    # 1. IRバンク
-    html, _ = _fetch(f"https://irbank.net/{code}/margin")
-    rows = _get_rows(html, ["買い残高","売り残高","倍率"])
-    if rows:
-        def mapper(row, dt):
-            bb,bc=_bal_chg(row[1]) if len(row)>1 else (None,None)
-            sb,sc=_bal_chg(row[3]) if len(row)>3 else (None,None)
-            return {"_dt":dt,"日付":dt.strftime("%Y/%m/%d"),
-                    "買い残高":bb,"買い増減":bc,"売り残高":sb,"売り増減":sc,
-                    "信用倍率":_to_float(row[5]) if len(row)>5 else None,
-                    "逆日歩":_parse_yaku(row[6]) if len(row)>6 else None}
-        recs = _parse_irbank_rows(rows, 4, mapper)
-        if recs:
-            df_irbank = pd.DataFrame(recs)
-            for c in ["買い残高","買い増減","売り残高","売り増減","信用倍率","逆日歩"]:
-                df_irbank[c] = pd.to_numeric(df_irbank.get(c), errors="coerce")
-            df_irbank = df_irbank.sort_values("_dt").reset_index(drop=True)
-            df_irbank["買い残増減率"] = df_irbank["買い残高"].pct_change() * 100
-            df_irbank["売り残増減率"] = df_irbank["売り残高"].pct_change() * 100
-            print(f"[{code}] 信用残(IRバンク): {len(df_irbank)}件")
+    if not df_yahoo.empty:
+        latest = df_yahoo["_dt"].max()
+        stale_days = (datetime.today() - latest).days
+        if stale_days <= MARGIN_STALE_DAYS:
+            print(f"[{code}] 信用残(Yahoo Finance): {len(df_yahoo)}件 最新{latest:%Y/%m/%d}")
+            return df_yahoo
+        print(f"[{code}] Yahoo信用残が{stale_days}日更新なし(最新{latest:%Y/%m/%d}) → 株たん/IRバンクで補完")
+    else:
+        print(f"[{code}] Yahoo信用残なし → 株たん")
 
-    if df_irbank.empty:
-        # IRバンクに1件もない → 株たん → Yahoo の順で試す
-        print(f"[{code}] IRバンク信用残なし → 株たん")
-        df = _fetch_shintan_margin(code)
-        if not df.empty:
-            return df
-        print(f"[{code}] 株たん失敗 → Yahoo Finance margin")
-        return _fetch_yahoo_margin(code)
-
-    # IRバンクにデータはあるが、最新日付の鮮度をチェック
-    latest = df_irbank["_dt"].max()
-    stale_days = (datetime.today() - latest).days
-    if stale_days <= MARGIN_STALE_DAYS:
-        return df_irbank
-
-    print(f"[{code}] IRバンク信用残が{stale_days}日更新なし(最新{latest:%Y/%m/%d}) → Yahoo/株たんで補完")
-    df_yahoo = _fetch_yahoo_margin(code)
-    df_merged = _merge_margin(df_irbank, df_yahoo)
-    new_latest = df_merged["_dt"].max()
-    if new_latest > latest:
-        print(f"[{code}] 補完成功: 最新{latest:%Y/%m/%d}→{new_latest:%Y/%m/%d}")
-        return df_merged
-
-    # Yahooでも更新できなければ株たんも試す
+    # Yahooが空、または古い場合は株たんで補完
     df_kabutan = _fetch_shintan_margin(code)
-    df_merged2 = _merge_margin(df_irbank, df_kabutan)
-    if df_merged2["_dt"].max() > latest:
-        print(f"[{code}] 株たんで補完成功: 最新{latest:%Y/%m/%d}→{df_merged2['_dt'].max():%Y/%m/%d}")
-        return df_merged2
+    df_merged = _merge_margin(df_yahoo, df_kabutan)
+    if not df_merged.empty:
+        new_latest = df_merged["_dt"].max()
+        if df_yahoo.empty or new_latest > df_yahoo["_dt"].max():
+            print(f"[{code}] 株たんで補完成功: 最新{new_latest:%Y/%m/%d}")
+            return df_merged
 
-    print(f"[{code}] Yahoo/株たんいずれも更新なし → IRバンクの{latest:%Y/%m/%d}時点データのまま")
-    return df_irbank
+    # それでも更新できなければIRバンクで補完（最後の手段）
+    print(f"[{code}] 株たんも不十分 → IRバンクで補完")
+    df_irbank = _fetch_irbank_margin(code)
+    df_final = _merge_margin(df_merged if not df_merged.empty else df_yahoo, df_irbank)
+    if not df_final.empty:
+        print(f"[{code}] 信用残: {len(df_final)}件 最新{df_final['_dt'].max():%Y/%m/%d}")
+        return df_final
+
+    print(f"[{code}] 信用残データ取得失敗（Yahoo/株たん/IRバンク全て0件）")
+    return pd.DataFrame(columns=MARGIN_COLS)
 
 # ════════════════════════════════════════
 # 価格 DataFrame 正規化（共通処理）
