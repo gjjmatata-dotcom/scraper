@@ -188,7 +188,9 @@ def _normalize_jp_code(code: str) -> str:
     """
     if re.fullmatch(r"[A-Z0-9]{8}", code):       return code  # 投資信託
     if re.match(r"998\d+\.(T|O)$", code):        return code  # 指数（既に.T/.O付き）
-    if re.fullmatch(r"\d{4}[A-Z]?", code):       return f"{code}.T"  # 裸の日本株/ETFコード
+    # 裸の日本株/ETFコード: 従来形式(4桁数字、例:9432/1570)と
+    # 2024年以降の新形式(3桁数字+英字1文字、例:285A/593A/153A)の両方に対応
+    if re.fullmatch(r"\d{4}|\d{3}[A-Z]", code):  return f"{code}.T"
     return code
 
 def _code_type(code: str) -> str:
@@ -452,10 +454,107 @@ def _parse_short_selling_table(html: str) -> pd.DataFrame:
     return df.sort_values("_dt").reset_index(drop=True)
 
 
+def _parse_shortboard_detailux_table(html: str) -> pd.DataFrame:
+    """
+    shortboard.detailux.com の銘柄別空売りページをパースする。
+    JPX公式データ由来。列見出しは「計算日」「空売り者」「残高数量」「残高割合」で、
+    残高割合セル内に "7.49% (+7.49%)" のように前回比が括弧内に埋め込まれる形式。
+    ヘッダー行から列インデックスを動的に判定し、サイト側の列順変更にも耐性を持たせる。
+    """
+    soup = BeautifulSoup(html, "lxml")
+    tgt = next((t for t in soup.find_all("table")
+                if "空売り者" in t.get_text() and ("残高" in t.get_text())), None)
+    if not tgt:
+        return pd.DataFrame(columns=SHORT_COLS)
+
+    rows = tgt.find_all("tr")
+    if len(rows) < 2:
+        return pd.DataFrame(columns=SHORT_COLS)
+
+    header_cells = [c.get_text(strip=True) for c in rows[0].find_all(["th","td"])]
+    idx = {"計算日": None, "空売り者": None, "残高数量": None, "残高割合": None}
+    for i, txt in enumerate(header_cells):
+        if "計算日" in txt or ("日" in txt and idx["計算日"] is None and "率" not in txt and "量" not in txt):
+            idx["計算日"] = i
+        elif "空売り者" in txt or "機関" in txt:
+            idx["空売り者"] = i
+        elif "数量" in txt:
+            idx["残高数量"] = i
+        elif "割合" in txt or "比率" in txt:
+            idx["残高割合"] = i
+    # ヘッダーが期待通り検出できなければ既定の並び(計算日,空売り者,残高数量,残高割合)にフォールバック
+    if any(v is None for v in idx.values()) and len(header_cells) >= 4:
+        idx = {"計算日": 0, "空売り者": 1, "残高数量": 2, "残高割合": 3}
+
+    today = datetime.today()
+    recs = []
+    for tr in rows[1:]:
+        cells = [td.get_text(strip=True) for td in tr.find_all(["th","td"])]
+        if len(cells) < 4: continue
+        try:
+            date_txt = cells[idx["計算日"]].strip()
+        except (TypeError, IndexError):
+            continue
+        m = (re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})", date_txt)
+             or re.match(r"(\d{1,2})/(\d{1,2})$", date_txt))
+        if not m: continue
+        if len(m.groups()) == 3:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        else:
+            mo, da = int(m.group(1)), int(m.group(2))
+            year = today.year
+            dt = datetime(year, mo, da)
+            if dt > today: dt = datetime(year - 1, mo, da)
+
+        inst = cells[idx["空売り者"]].strip() if idx["空売り者"] is not None else None
+        qty  = _to_float(cells[idx["残高数量"]].replace(",", "")) if idx["残高数量"] is not None else None
+
+        ratio_cell = cells[idx["残高割合"]] if idx["残高割合"] is not None else ""
+        rm = re.match(r"([\d.]+)%\s*\(([+\-][\d.]+)%\)", ratio_cell)
+        if rm:
+            ratio = _to_float(rm.group(1)); diff = _to_float(rm.group(2))
+        else:
+            ratio = _to_float(ratio_cell.replace("%", "")); diff = None
+
+        if inst is None or qty is None:
+            continue
+        recs.append({"_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
+                     "空売り機関": inst, "残高比率": ratio, "増減率差": diff,
+                     "残高数量": qty, "増減量": None})
+
+    if not recs:
+        return pd.DataFrame(columns=SHORT_COLS)
+    df = pd.DataFrame(recs)
+    for c in ["残高比率","増減率差","残高数量"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.sort_values(["空売り機関","_dt"]).reset_index(drop=True)
+    # 増減量が明示されないサイトのため、機関ごとの残高数量の前回差分から算出する
+    df["増減量"] = df.groupby("空売り機関")["残高数量"].diff()
+    return df.sort_values("_dt").reset_index(drop=True)
+
+
+def _fetch_shortboard_detailux(code: str) -> pd.DataFrame:
+    """
+    JPX公式データを再集計している shortboard.detailux.com のフォールバック取得。
+    nikkeiyosoku.com にデータが無い銘柄（対応外・掲載遅延など）の補完用。
+    URL規則: https://shortboard.detailux.com/stocks/{証券コード}
+    """
+    base = re.sub(r"\.[A-Z]+$", "", code)
+    url = f"https://shortboard.detailux.com/stocks/{base}"
+    html, status = _fetch(url, referer="https://shortboard.detailux.com/")
+    if not html or status != 200:
+        print(f"[機関空売り(detailux)] {code}: status={status}")
+        return pd.DataFrame(columns=SHORT_COLS)
+    df = _parse_shortboard_detailux_table(html)
+    if df.empty:
+        print(f"[機関空売り(detailux)] {code}: データ0件")
+    return df
+
+
 def fetch_institutional_short(code: str) -> dict:
     """
-    nikkeiyosoku.com の空売り機関別データを取得する。
-    URL: ETFは /stock_etf/short/{code}/ 、個別株は /stock/short/{code}/
+    機関投資家 空売り残高データを取得する。
+    優先順: nikkeiyosoku.com → shortboard.detailux.com（JPX公式データ由来のフォールバック）
     「もっと見る」はJS描画のためページネーション不可 → 取得できた範囲内で
     増加トップ{SHORT_TOPN}件・減少トップ{SHORT_TOPN}件を強調表示対象として算出する。
 
@@ -481,7 +580,11 @@ def fetch_institutional_short(code: str) -> dict:
                 break
 
     if df.empty:
-        print(f"[機関空売り] {code}: データ0件")
+        print(f"[機関空売り] {code}: nikkeiyosoku 0件 → shortboard.detailux.comで補完")
+        df = _fetch_shortboard_detailux(code)
+
+    if df.empty:
+        print(f"[機関空売り] {code}: データ0件（両ソースとも失敗）")
         return empty
 
     top_increase = df[df["増減量"] > 0].nlargest(SHORT_TOPN, "増減量")
@@ -624,6 +727,118 @@ def _fetch_shintan_margin(code: str) -> pd.DataFrame:
     print(f"[株たん] {code}: {len(df)}件取得")
     return df
 
+def _parse_nikkeiyosoku_margin_table(html: str) -> pd.DataFrame:
+    """
+    nikkeiyosoku.com（投資の森）の信用残高ページをパースする。
+    列構成: 日付(YYYY/M/D) | 売り残 | 売り増減 | 買い残 | 買い増減 | 信用倍率
+    （同サイトの空売りページ用パーサーと違い、日付セルに年が含まれる点に注意）
+    """
+    soup = BeautifulSoup(html, "lxml")
+    tgt = next((t for t in soup.find_all("table")
+                if "信用倍率" in t.get_text() and "買い残" in t.get_text() and "売り残" in t.get_text()), None)
+    if not tgt:
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    rows = tgt.find_all("tr")
+    if len(rows) < 2:
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    recs = []
+    for tr in rows[1:]:
+        cells = [td.get_text(strip=True) for td in tr.find_all(["th", "td"])]
+        if len(cells) < 6:
+            continue
+        m = re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})", cells[0].strip())
+        if not m:
+            continue
+        try:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            continue
+        sb = _to_float(cells[1]); sc = _to_float(cells[2])
+        bb = _to_float(cells[3]); bc = _to_float(cells[4])
+        rat = _to_float(cells[5])
+        recs.append({"_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
+                     "買い残高": bb, "買い増減": bc,
+                     "売り残高": sb, "売り増減": sc,
+                     "信用倍率": rat, "逆日歩": None})
+
+    if not recs:
+        return pd.DataFrame(columns=MARGIN_COLS)
+    df = pd.DataFrame(recs)
+    for c in ["買い残高", "買い増減", "売り残高", "売り増減", "信用倍率"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.sort_values("_dt").reset_index(drop=True)
+    df["買い残増減率"] = df["買い残高"].pct_change() * 100
+    df["売り残増減率"] = df["売り残高"].pct_change() * 100
+    return df
+
+
+def _fetch_nikkeiyosoku_margin(code) -> pd.DataFrame:
+    """
+    nikkeiyosoku.com（投資の森）の信用残高ページを取得する。
+    URL: https://nikkeiyosoku.com/stock/margin/{code}/     （個別株）
+         https://nikkeiyosoku.com/stock_etf/margin/{code}/ （ETF）
+    事前にETF/個別株の判別がつかないため、fetch_institutional_shortと同様に両方試す。
+    """
+    base = re.sub(r"\.[A-Z]+$", "", code)
+    for path in ("stock_etf", "stock"):
+        url = f"https://nikkeiyosoku.com/{path}/margin/{base}/"
+        html, status = _fetch(url, referer="https://nikkeiyosoku.com/")
+        if not html or status != 200:
+            continue
+        df = _parse_nikkeiyosoku_margin_table(html)
+        if not df.empty:
+            print(f"[投資の森信用残] {code}({path}): {len(df)}件取得 最新{df['_dt'].max():%Y/%m/%d}")
+            return df
+    print(f"[投資の森信用残] {code}: 取得失敗")
+    return pd.DataFrame(columns=MARGIN_COLS)
+
+
+def _fetch_irbank_margin(code) -> pd.DataFrame:
+    """
+    irbank.net の週次信用取引情報ページ（東証発表・信用取引残高）を取得する。
+    URL: https://irbank.net/{code}/margin
+    ページ形式: 日付 / 買い残高（残高 前週比） / 一般・制度内訳 / 売り残高（残高 前週比） / 一般・制度内訳 / 倍率
+    Yahoo Financeの信用残タブは現在クライアント側JS描画のため静的HTML取得では
+    テーブルが存在せず取得不可（下記_fetch_yahoo_marginは常に空を返す状態）。
+    IRバンクは信用残テーブルがサーバー側で静的HTMLに描画されるため、これを第一取得元とする。
+    """
+    base = re.sub(r"\.[A-Z]+$", "", code)
+    html, status = _fetch(f"https://irbank.net/{base}/margin", referer="https://irbank.net/")
+    if not html or status != 200:
+        print(f"[IRバンク信用残] {code}: status={status}")
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    rows = _get_rows(html, ["買い残高", "売り残高", "倍率"])
+    if not rows:
+        print(f"[IRバンク信用残] {code}: テーブル未検出（信用銘柄でない可能性）")
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    def mapper(row, dt):
+        bb, bc = _bal_chg(row[1]) if len(row) > 1 else (None, None)
+        sb, sc = _bal_chg(row[3]) if len(row) > 3 else (None, None)
+        return {"_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
+                "買い残高": bb, "買い増減": bc,
+                "売り残高": sb, "売り増減": sc,
+                "信用倍率": _to_float(row[5]) if len(row) > 5 else None,
+                "逆日歩": None}
+
+    recs = _parse_irbank_rows(rows, 6, mapper)
+    if not recs:
+        print(f"[IRバンク信用残] {code}: データ0件")
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    df = pd.DataFrame(recs)
+    for c in ["買い残高", "買い増減", "売り残高", "売り増減", "信用倍率"]:
+        df[c] = pd.to_numeric(df.get(c), errors="coerce")
+    df = df.sort_values("_dt").reset_index(drop=True)
+    df["買い残増減率"] = df["買い残高"].pct_change() * 100
+    df["売り残増減率"] = df["売り残高"].pct_change() * 100
+    print(f"[IRバンク信用残] {code}: {len(df)}件取得")
+    return df
+
+
 def _fetch_yahoo_margin_page(ticker: str, page: int) -> pd.DataFrame:
     """Yahoo Finance信用残ページの1ページ分を取得してDataFrameで返す（内部用）。"""
     url = f"https://finance.yahoo.co.jp/quote/{ticker}/history?styl=margin&page={page}"
@@ -724,69 +939,40 @@ def _merge_margin(df_base: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFrame:
     merged["売り残増減率"] = merged["売り残高"].pct_change() * 100
     return merged
 
-def _fetch_irbank_margin(code) -> pd.DataFrame:
-    """IRバンクから週次信用残を取得する（内部用・Yahoo取得失敗時の補完に使用）。"""
-    html, _ = _fetch(f"https://irbank.net/{code}/margin")
-    rows = _get_rows(html, ["買い残高","売り残高","倍率"])
-    if not rows:
-        return pd.DataFrame(columns=MARGIN_COLS)
-    def mapper(row, dt):
-        bb,bc=_bal_chg(row[1]) if len(row)>1 else (None,None)
-        sb,sc=_bal_chg(row[3]) if len(row)>3 else (None,None)
-        return {"_dt":dt,"日付":dt.strftime("%Y/%m/%d"),
-                "買い残高":bb,"買い増減":bc,"売り残高":sb,"売り増減":sc,
-                "信用倍率":_to_float(row[5]) if len(row)>5 else None,
-                "逆日歩":_parse_yaku(row[6]) if len(row)>6 else None}
-    recs = _parse_irbank_rows(rows, 4, mapper)
-    if not recs:
-        return pd.DataFrame(columns=MARGIN_COLS)
-    df = pd.DataFrame(recs)
-    for c in ["買い残高","買い増減","売り残高","売り増減","信用倍率","逆日歩"]:
-        df[c] = pd.to_numeric(df.get(c), errors="coerce")
-    df = df.sort_values("_dt").reset_index(drop=True)
-    df["買い残増減率"] = df["買い残高"].pct_change() * 100
-    df["売り残増減率"] = df["売り残高"].pct_change() * 100
-    return df
-
-
 def fetch_margin(code) -> pd.DataFrame:
     """
     週次信用残取得。
-    優先順: Yahoo Finance margin(page1-3) → 株たん → IRバンク
-    IRバンクは更新頻度が低いため、Yahoo Financeを第一取得元に変更。
-    Yahooのデータが取得できても件数が少ない/最新日付が古い場合は、
-    株たん・IRバンクの情報で不足分を補ってマージする。
+
+    【2026年8月時点の状況】
+    - nikkeiyosoku.com（投資の森）: stock(_etf)/margin/{code}/ ページが静的HTMLで
+      直近データ（当該週の金曜時点）まで確実に取得可能。これを第一ソースとする。
+    - IRバンク(irbank.net/{code}/margin): 静的HTMLで取得可能だが反映がやや遅いため、
+      投資の森が取得できなかった場合の保険として残す。
+    - Yahoo Finance: 信用残時系列タブがクライアント側JS描画のため通常は取得不可。
+    - 株探(kabutan.jp): 週次信用残時系列データが株探プレミアム会員限定のため通常は取得不可。
+      （Yahoo/株探は将来的に静的取得が復活した場合に備え、保険的に最後に試す）
     """
+    df = _fetch_nikkeiyosoku_margin(code)
+    if not df.empty:
+        print(f"[{code}] 信用残(投資の森): {len(df)}件 最新{df['_dt'].max():%Y/%m/%d}")
+        return df
+
+    df = _fetch_irbank_margin(code)
+    if not df.empty:
+        print(f"[{code}] 信用残(IRバンク): {len(df)}件 最新{df['_dt'].max():%Y/%m/%d}")
+        return df
+
     df_yahoo = _fetch_yahoo_margin(code)  # page 1〜3をマージ済み
-
     if not df_yahoo.empty:
-        latest = df_yahoo["_dt"].max()
-        stale_days = (datetime.today() - latest).days
-        if stale_days <= MARGIN_STALE_DAYS:
-            print(f"[{code}] 信用残(Yahoo Finance): {len(df_yahoo)}件 最新{latest:%Y/%m/%d}")
-            return df_yahoo
-        print(f"[{code}] Yahoo信用残が{stale_days}日更新なし(最新{latest:%Y/%m/%d}) → 株たん/IRバンクで補完")
-    else:
-        print(f"[{code}] Yahoo信用残なし → 株たん")
+        print(f"[{code}] 信用残(Yahoo Finance): {len(df_yahoo)}件 最新{df_yahoo['_dt'].max():%Y/%m/%d}")
+        return df_yahoo
 
-    # Yahooが空、または古い場合は株たんで補完
     df_kabutan = _fetch_shintan_margin(code)
-    df_merged = _merge_margin(df_yahoo, df_kabutan)
-    if not df_merged.empty:
-        new_latest = df_merged["_dt"].max()
-        if df_yahoo.empty or new_latest > df_yahoo["_dt"].max():
-            print(f"[{code}] 株たんで補完成功: 最新{new_latest:%Y/%m/%d}")
-            return df_merged
+    if not df_kabutan.empty:
+        print(f"[{code}] 信用残(株たん): {len(df_kabutan)}件 最新{df_kabutan['_dt'].max():%Y/%m/%d}")
+        return df_kabutan
 
-    # それでも更新できなければIRバンクで補完（最後の手段）
-    print(f"[{code}] 株たんも不十分 → IRバンクで補完")
-    df_irbank = _fetch_irbank_margin(code)
-    df_final = _merge_margin(df_merged if not df_merged.empty else df_yahoo, df_irbank)
-    if not df_final.empty:
-        print(f"[{code}] 信用残: {len(df_final)}件 最新{df_final['_dt'].max():%Y/%m/%d}")
-        return df_final
-
-    print(f"[{code}] 信用残データ取得失敗（Yahoo/株たん/IRバンク全て0件）")
+    print(f"[{code}] 信用残: 全ソースで取得失敗")
     return pd.DataFrame(columns=MARGIN_COLS)
 
 # ════════════════════════════════════════
@@ -1147,8 +1333,8 @@ def fetch_price(code, days=35) -> pd.DataFrame:
         suffixes = [""]               # 投資信託: コードそのまま、.T等は付けない
     elif ct == "index_jp":
         suffixes = [""]               # 既に998xxx.T/.O形式
-    elif re.fullmatch(r"\d{4}[A-Z]?", base):
-        suffixes = [".T"]             # 裸の日本株/ETFコード
+    elif re.fullmatch(r"\d{4}|\d{3}[A-Z]", base):
+        suffixes = [".T"]             # 裸の日本株/ETFコード（新形式3桁+英字も含む）
     elif re.fullmatch(r"\d{6}", base):
         suffixes = [".T",".O",".N",".L"]
     else:

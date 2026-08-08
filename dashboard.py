@@ -220,7 +220,7 @@ def cell_style(disp,raw,dcol,num_cols,neg_red=None,thr=3.0):
 def get_latest_margin_bal(M):
     if M.empty: return None,None
     ms=M.sort_values("_dt",ascending=False)
-    b=ms["買い残高"].dropna(); s=ms["売い残高"].dropna() if "売い残高" in ms.columns else ms["売り残高"].dropna()
+    b=ms["買い残高"].dropna(); s=ms["売り残高"].dropna()
     return (b.iloc[0] if not b.empty else None),(s.iloc[0] if not s.empty else None)
 
 PERIOD_OPTIONS={"1ヶ月":30,"3ヶ月":90,"6ヶ月":180,"1年":365,"2年":730,"3年":1095,"5年":1825,"全期間":0}
@@ -1313,26 +1313,46 @@ def render_stock(code, info, col_hex):
         fig1.add_hline(y=0,line_dash="solid",line_color="#484f58",line_width=1,row=2,col=1)
         fig_base(fig1,400); st.plotly_chart(fig1,use_container_width=True)
 
-        LCOLS=["申込日","買い残高","買い残高(信用%)","買い増減","買い新規","買い返済",
-               "売り残高","売り残高(信用%)","売り増減","売り新規","売り返済","貸借倍率","逆日歩"]
-        LNUM =["買い残高","買い増減","買い新規","買い返済","売り残高","売り増減","売り新規","売り返済"]
-        Ld=L.sort_values("_dt",ascending=False).reset_index(drop=True)
+        LCOLS=["申込日","融資残高","融資残高(対信用比%)","融資増減率（前日比%）","融資新規","融資返済",
+               "貸株残高","貸株残高(対信用比%)","貸株増減率（前日比%）","貸株新規","貸株返済","貸借倍率","逆日歩"]
+        SRC2DISP={"買い残高":"融資残高","買い新規":"融資新規","買い返済":"融資返済",
+                  "売り残高":"貸株残高","売り新規":"貸株新規","売り返済":"貸株返済"}
+        LNUM_SRC=["買い残高","買い新規","買い返済","売り残高","売り新規","売り返済"]
+
+        # 前日比%は「増減」列（一部ソースでは未提供のため直近日が欠損しがち）に依存せず、
+        # 残高同士の日次変化率（pct_change）から直接算出する。①はtaisyaku.jp/IRバンクいずれも
+        # 日次データのため、週次信用残(②)とは無関係に計算される。
+        La_asc=L.sort_values("_dt",ascending=True).reset_index(drop=True)
+        La_asc["融資増減率"]=La_asc["買い残高"].pct_change()*100
+        La_asc["貸株増減率"]=La_asc["売り残高"].pct_change()*100
+        Ld=La_asc.sort_values("_dt",ascending=False).reset_index(drop=True)
+
         dp=pd.DataFrame(); dp["申込日"]=Ld["申込日"]
-        for c in LNUM: dp[c]=Ld[c].apply(fmt) if c in Ld.columns else "-"
-        dp["買い残高(信用%)"]=Ld["買い残高"].apply(
+        for src,disp in SRC2DISP.items():
+            dp[disp]=Ld[src].apply(fmt) if src in Ld.columns else "-"
+        dp["融資増減率（前日比%）"]=Ld["融資増減率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
+        dp["貸株増減率（前日比%）"]=Ld["貸株増減率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
+        dp["融資残高(対信用比%)"]=Ld["買い残高"].apply(
             lambda v:f"{float(v)/lmb*100:.1f}%" if pd.notna(v) and lmb and lmb>0 else "-")
-        dp["売り残高(信用%)"]=Ld["売り残高"].apply(
+        dp["貸株残高(対信用比%)"]=Ld["売り残高"].apply(
             lambda v:f"{float(v)/lms*100:.1f}%" if pd.notna(v) and lms and lms>0 else "-")
         dp["貸借倍率"]=Ld["貸借倍率"].apply(
             lambda v:"-" if pd.isna(v) else "∞" if abs(v)==float("inf") else f"{v:.2f}倍")
         dp["逆日歩"]=Ld["逆日歩"].apply(lambda v:f"{v:.2f}" if pd.notna(v) and v>0 else "-")
         av={c:"" for c in LCOLS}; av["申込日"]="【平均】"
-        for c in LNUM: av[c]=fmt(Ld[c].mean(skipna=True))
+        for src,disp in SRC2DISP.items(): av[disp]=fmt(Ld[src].mean(skipna=True))
+        av["融資増減率（前日比%）"]=fmt(Ld["融資増減率"].mean(skipna=True),dec=2,suffix="%")
+        av["貸株増減率（前日比%）"]=fmt(Ld["貸株増減率"].mean(skipna=True),dec=2,suffix="%")
         av["貸借倍率"]=fmt(Ld["貸借倍率"].replace([float("inf"),float("-inf")],float("nan")).mean(skipna=True),dec=2,suffix="倍")
         av["逆日歩"]=fmt(Ld["逆日歩"].mean(skipna=True),dec=2)
         avail_lcols=[c for c in LCOLS if c in dp.columns]
         disp_l=pd.concat([dp[avail_lcols],pd.DataFrame([{c:av.get(c,"") for c in avail_lcols}])],ignore_index=True)
-        st_l=cell_style(disp_l,Ld,"申込日",LNUM,neg_red=["差引残高"])
+        # cell_styleは表示dp側の列名で数値着色を行うため、Ld側にも表示名で数値列を複製しておく
+        Ld_style=Ld.rename(columns=SRC2DISP)
+        Ld_style["融資増減率（前日比%）"]=Ld["融資増減率"]
+        Ld_style["貸株増減率（前日比%）"]=Ld["貸株増減率"]
+        LNUM_DISP=[SRC2DISP[c] for c in LNUM_SRC]
+        st_l=cell_style(disp_l,Ld_style,"申込日",LNUM_DISP+["融資増減率（前日比%）","貸株増減率（前日比%）"],neg_red=["差引残高"])
         for idx in disp_l[disp_l["申込日"]!="【平均】"].index:
             dv=disp_l.loc[idx,"申込日"]
             orig=Ld.loc[Ld["申込日"]==dv,"逆日歩"]
