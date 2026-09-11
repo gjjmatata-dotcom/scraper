@@ -790,17 +790,20 @@ def render_technical_section(code, info, col_hex, period_days):
                 specs=[[{"secondary_y": True}],[{"secondary_y": False}]])
 
             # 買い残・売り残
+            # 文字列の日付(週1回更新)ではなく実際のdatetime(_dt)をx軸に使う。
+            # 週次データ(Ma)と日次の株価(Pa_chr)を同じ文字列カテゴリ軸で重ねると、
+            # 日付の粒度が異なるため軸がずれて櫛状に破綻するため。
             fig_m.add_trace(go.Scatter(
-                x=Ma["日付"], y=Ma["買い残高"], name="買い残高",
+                x=Ma["_dt"], y=Ma["買い残高"], name="買い残高",
                 line=dict(color="#388bfd", width=2),
                 fill="tozeroy", fillcolor="rgba(56,139,253,0.1)",
-                hovertemplate="%{x}<br>買い残高:%{y:,.0f}<extra></extra>"),
+                hovertemplate="%{x|%Y/%m/%d}<br>買い残高:%{y:,.0f}<extra></extra>"),
                 row=1, col=1, secondary_y=False)
             fig_m.add_trace(go.Scatter(
-                x=Ma["日付"], y=Ma["売り残高"], name="売り残高",
+                x=Ma["_dt"], y=Ma["売り残高"], name="売り残高",
                 line=dict(color="#f85149", width=2),
                 fill="tozeroy", fillcolor="rgba(248,81,73,0.1)",
-                hovertemplate="%{x}<br>売り残高:%{y:,.0f}<extra></extra>"),
+                hovertemplate="%{x|%Y/%m/%d}<br>売り残高:%{y:,.0f}<extra></extra>"),
                 row=1, col=1, secondary_y=False)
 
             # 株価を右軸に重ねる
@@ -811,9 +814,9 @@ def render_technical_section(code, info, col_hex, period_days):
                     Pa_chr = Pa_chr[Pa_chr["_dt"] >= cutoff2]
                 if not Pa_chr.empty:
                     fig_m.add_trace(go.Scatter(
-                        x=Pa_chr["日付"], y=Pa_chr["終値"], name="株価",
+                        x=Pa_chr["_dt"], y=Pa_chr["終値"], name="株価",
                         line=dict(color="#e3b341", width=1.5, dash="dot"),
-                        hovertemplate="%{x}<br>¥%{y:,.1f}<extra></extra>"),
+                        hovertemplate="%{x|%Y/%m/%d}<br>¥%{y:,.1f}<extra></extra>"),
                         row=1, col=1, secondary_y=True)
                     fig_m.update_yaxes(title_text="株価", secondary_y=True,
                         tickfont=dict(color="#e3b341", size=9),
@@ -822,11 +825,11 @@ def render_technical_section(code, info, col_hex, period_days):
             # 信用倍率
             if "信用倍率" in Ma.columns:
                 fig_m.add_trace(go.Scatter(
-                    x=Ma["日付"], y=Ma["信用倍率"], name="信用倍率",
+                    x=Ma["_dt"], y=Ma["信用倍率"], name="信用倍率",
                     mode="lines+markers",
                     line=dict(color="#e3b341", width=2),
                     marker=dict(size=5),
-                    hovertemplate="%{x}<br>信用倍率:%{y:.2f}倍<extra></extra>"),
+                    hovertemplate="%{x|%Y/%m/%d}<br>信用倍率:%{y:.2f}倍<extra></extra>"),
                     row=2, col=1)
                 fig_m.add_hline(y=1.0, line_dash="dash", line_color="#f85149",
                     annotation_text="1倍", annotation_font_color="#f85149",
@@ -840,11 +843,12 @@ def render_technical_section(code, info, col_hex, period_days):
                 chg_colors = ["#3fb950" if v >= 0 else "#f85149"
                               for v in Ma["買い残増減率"].fillna(0)]
                 fig_m.add_trace(go.Bar(
-                    x=Ma["日付"], y=Ma["買い残増減率"],
+                    x=Ma["_dt"], y=Ma["買い残増減率"],
                     name="買い残増減率%", marker_color=chg_colors, opacity=0.6,
-                    hovertemplate="%{x}<br>買い残増減:%{y:+.2f}%<extra></extra>"),
+                    hovertemplate="%{x|%Y/%m/%d}<br>買い残増減:%{y:+.2f}%<extra></extra>"),
                     row=2, col=1)
 
+            fig_m.update_xaxes(tickformat="%Y/%m/%d")
             fig_base(fig_m, 420)
             st.plotly_chart(fig_m, use_container_width=True)
 
@@ -1292,25 +1296,33 @@ def render_stock(code, info, col_hex):
         La=L.sort_values("_dt",ascending=True)
         fig1=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.65,0.35],
             vertical_spacing=0.05,
-            subplot_titles=["買い残高・売り残高＋株価（右軸）","資金フロー（買い新規－売り新規）"],
+            subplot_titles=["融資残高・貸株残高＋株価（右軸）","資金フロー（融資新規－貸株新規）"],
             specs=[[{"secondary_y":True}],[{"secondary_y":False}]])
-        fig1.add_trace(go.Scatter(x=La["申込日"],y=La["買い残高"],name="買い残高",
-            line=dict(color="#388bfd",width=2),fill="tozeroy",fillcolor="rgba(56,139,253,0.08)"),
+        # 文字列の日付(申込日)ではなく実際のdatetime(_dt)をx軸に使う。
+        # 融資/貸株残高(日次・約35日分)と株価を同じ文字列カテゴリ軸で重ねると、
+        # 両者の日付集合が完全一致しない場合に軸がずれて破綻するため。
+        fig1.add_trace(go.Scatter(x=La["_dt"],y=La["買い残高"],name="融資残高",
+            line=dict(color="#388bfd",width=2),fill="tozeroy",fillcolor="rgba(56,139,253,0.08)",
+            hovertemplate="%{x|%Y/%m/%d}<br>融資残高:%{y:,.0f}<extra></extra>"),
             row=1,col=1,secondary_y=False)
-        fig1.add_trace(go.Scatter(x=La["申込日"],y=La["売り残高"],name="売り残高",
-            line=dict(color="#f85149",width=2),fill="tozeroy",fillcolor="rgba(248,81,73,0.08)"),
+        fig1.add_trace(go.Scatter(x=La["_dt"],y=La["売り残高"],name="貸株残高",
+            line=dict(color="#f85149",width=2),fill="tozeroy",fillcolor="rgba(248,81,73,0.08)",
+            hovertemplate="%{x|%Y/%m/%d}<br>貸株残高:%{y:,.0f}<extra></extra>"),
             row=1,col=1,secondary_y=False)
         if not P.empty:
             Pa2=P.sort_values("_dt",ascending=True)
-            fig1.add_trace(go.Scatter(x=Pa2["日付"],y=Pa2["終値"],name="株価",
-                line=dict(color="#e3b341",width=1.5,dash="dot")),row=1,col=1,secondary_y=True)
+            fig1.add_trace(go.Scatter(x=Pa2["_dt"],y=Pa2["終値"],name="株価",
+                line=dict(color="#e3b341",width=1.5,dash="dot"),
+                hovertemplate="%{x|%Y/%m/%d}<br>¥%{y:,.1f}<extra></extra>"),row=1,col=1,secondary_y=True)
             fig1.update_yaxes(title_text="株価",secondary_y=True,gridcolor="#21262d",
                 tickfont=dict(color="#e3b341",size=9),tickformat=",",row=1,col=1)
         flow=La["買い新規"].fillna(0)-La.get("売り新規",pd.Series([0]*len(La))).fillna(0)
-        fig1.add_trace(go.Bar(x=La["申込日"],y=flow,name="資金フロー",
-            marker_color=["#388bfd" if v>=0 else "#f85149" for v in flow],opacity=0.85),
+        fig1.add_trace(go.Bar(x=La["_dt"],y=flow,name="資金フロー",
+            marker_color=["#388bfd" if v>=0 else "#f85149" for v in flow],opacity=0.85,
+            hovertemplate="%{x|%Y/%m/%d}<br>資金フロー:%{y:,.0f}<extra></extra>"),
             row=2,col=1)
         fig1.add_hline(y=0,line_dash="solid",line_color="#484f58",line_width=1,row=2,col=1)
+        fig1.update_xaxes(tickformat="%Y/%m/%d")
         fig_base(fig1,400); st.plotly_chart(fig1,use_container_width=True)
 
         LCOLS=["申込日","融資残高","融資残高(対信用比%)","融資増減率（前日比%）","融資新規","融資返済",
