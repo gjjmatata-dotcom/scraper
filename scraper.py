@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
+from io import StringIO
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
@@ -629,8 +630,15 @@ def fetch_lending(code) -> pd.DataFrame:
     if df_r.empty:   df=df_i
     elif df_i.empty: df=df_r
     else:
+        # df_r(taisyaku由来)は「買い増減」「売り増減」が常にNoneのため全NA列となり、
+        # 数値列を持つdf_iと直接concatするとdtype推論に関するFutureWarningが出る。
+        # 明示的にfloat型にキャストしてから結合する。
+        for c in ("買い増減","売り増減"):
+            if c in df_r.columns: df_r[c]=df_r[c].astype(float)
         rd=set(df_r["申込日"])
-        df=pd.concat([df_i[~df_i["申込日"].isin(rd)],df_r],ignore_index=True)
+        df_i_extra=df_i[~df_i["申込日"].isin(rd)]
+        frames=[f for f in (df_i_extra,df_r) if not f.empty]
+        df=pd.concat(frames,ignore_index=True) if frames else pd.DataFrame(columns=LEND_COLS)
     df=df.sort_values("_dt").reset_index(drop=True)
     cutoff=datetime.today()-timedelta(days=35)
     df=df[df["_dt"]>=cutoff].reset_index(drop=True)
@@ -839,49 +847,128 @@ def _fetch_irbank_margin(code) -> pd.DataFrame:
     return df
 
 
-def _fetch_yahoo_margin_page(ticker: str, page: int) -> pd.DataFrame:
-    """Yahoo Finance信用残ページの1ページ分を取得してDataFrameで返す（内部用）。"""
-    url = f"https://finance.yahoo.co.jp/quote/{ticker}/history?styl=margin&page={page}"
-    html, status = _fetch(url, referer="https://finance.yahoo.co.jp/")
-    if not html or status != 200:
-        return pd.DataFrame(columns=MARGIN_COLS), status
+_YAHOO_MARGIN_DATE_RE = re.compile(r"(\d{2,4})\s*[/年]\s*(\d{1,2})\s*[/月]\s*(\d{1,2})")
 
-    soup = BeautifulSoup(html, "lxml")
-    # Yahoo Financeの実際の見出しは「売残」「買残」（送り仮名なし）のため「買い残」等での
-    # 完全一致検索では見つからない。「買」「売」「残」の3文字が揃う表を探す方式に修正。
-    tgt = next((t for t in soup.find_all("table")
-                if "買" in t.get_text() and "売" in t.get_text() and "残" in t.get_text()), None)
-    if not tgt:
-        return pd.DataFrame(columns=MARGIN_COLS), status
+def _yahoo_margin_parse_date(text):
+    """'2026/9/25' '26/09/25' '2026年9月25日' などをdatetimeに変換。不可ならNone。"""
+    m = _YAHOO_MARGIN_DATE_RE.search(str(text))
+    if not m:
+        return None
+    y, mo, d = map(int, m.groups())
+    if y < 100:
+        y += 2000
+    try:
+        return datetime(y, mo, d)
+    except ValueError:
+        return None
 
-    rows = tgt.find_all("tr")
-    if not rows:
-        return pd.DataFrame(columns=MARGIN_COLS), status
+def _yahoo_margin_to_number(x):
+    """'1,234' '+56' '▲12' '--' '3.45倍' などを数値に。変換不可はNone。"""
+    s = str(x).replace(",", "").replace("株", "").replace("倍", "").strip()
+    s = s.replace("▲", "-").replace("△", "-").replace("＋", "+").replace("−", "-")
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
-    # ヘッダー行から列インデックスを動的判定（実際の列順は 日付/売残/買残/売残増減/買残増減/信用倍率）
-    header_cells = [c.get_text(strip=True) for c in rows[0].find_all(["th","td"])]
-    cmap = _detect_margin_col_map(header_cells)
+def _parse_yahoo_margin_table(html: str) -> pd.DataFrame:
+    """
+    Yahoo!ファイナンス信用残ページ(styl=margin)を解析する。
+    従来はBeautifulSoupで「買」「売」「残」の3文字が揃う表を探していたが、
+    現行ページでは見つからず取得不可になっていたため、pandas.read_html で
+    ページ内の全tableを読み込み「先頭列の過半数が日付として解釈できる表」を
+    対象テーブルとみなす方式に変更（実際に動作確認済みの方式）。
+    列構成(先頭6列、実ページで確認済み): 日付 | 売残 | 買残 | 売残増減 | 買残増減 | 信用倍率
+    （残高(売残・買残)が先にまとまり、増減(売残増減・買残増減)はその後にまとまる構成。
+    　「売残→売残増減→買残→買残増減」という交互構成だと誤認して実装していたため、
+    　買い残高に売残増減の値が、売り増減に買残の値が入ってしまうバグがあった）
+    """
+    try:
+        tables = pd.read_html(StringIO(html))
+    except ValueError:
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    tgt = None
+    for df in tables:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = ["".join(dict.fromkeys(map(str, c))) for c in df.columns]
+        if len(df) == 0:
+            continue
+        hits = df.iloc[:, 0].map(lambda v: _yahoo_margin_parse_date(v) is not None).sum()
+        if hits >= max(1, len(df) // 2):
+            tgt = df
+            break
+    if tgt is None:
+        return pd.DataFrame(columns=MARGIN_COLS)
+
+    tgt = tgt.copy()
+    tgt["_dt"] = tgt.iloc[:, 0].map(_yahoo_margin_parse_date)
+    tgt = tgt.dropna(subset=["_dt"])
+    raw_cols = [c for c in tgt.columns if c != "_dt"]
+    if tgt.empty or len(raw_cols) < 6:
+        return pd.DataFrame(columns=MARGIN_COLS)
 
     recs = []
-    for tr in rows[1:]:
-        cells = [td.get_text(strip=True) for td in tr.find_all(["th","td"])]
-        if len(cells) < 3: continue
-        c0 = cells[0].strip(); dt = None
-        m = (re.match(r"(\d{4})年(\d{1,2})月(\d{1,2})日", c0)
-             or re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})", c0))
-        if not m: continue
-        try: dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except: continue
-        def g(i): return _to_float(cells[i]) if i is not None and len(cells) > i else None
+    for _, row in tgt.iterrows():
+        dt = row["_dt"]
         recs.append({
             "_dt": dt, "日付": dt.strftime("%Y/%m/%d"),
-            "買い残高": g(cmap["買残高"]), "買い増減": g(cmap["買増減"]),
-            "売り残高": g(cmap["売残高"]), "売り増減": g(cmap["売増減"]),
-            "信用倍率": g(cmap["倍率"]),
+            "売り残高": _yahoo_margin_to_number(row[raw_cols[1]]),
+            "買い残高": _yahoo_margin_to_number(row[raw_cols[2]]),
+            "売り増減": _yahoo_margin_to_number(row[raw_cols[3]]),
+            "買い増減": _yahoo_margin_to_number(row[raw_cols[4]]),
+            "信用倍率": _yahoo_margin_to_number(row[raw_cols[5]]),
             "逆日歩":   None,
         })
-    return pd.DataFrame(recs), status
+    return pd.DataFrame(recs)
 
+
+_YAHOO_MARGIN_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ja,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+
+# ブラウザのようにCookieを保持しながら同一セッションでリクエストし続けるための
+# モジュールレベルのセッション（毎回使い捨てのrequests.get()より実ブラウザに近い挙動）
+_yahoo_margin_session = requests.Session()
+_yahoo_margin_session.headers.update(_YAHOO_MARGIN_HEADERS)
+
+
+def _fetch_yahoo_margin_page(ticker: str, page: int) -> pd.DataFrame:
+    """
+    Yahoo Finance信用残ページの1ページ分を取得してDataFrameで返す（内部用）。
+
+    共通の_fetch()は Referer: https://finance.yahoo.co.jp/ を付与してリクエストするが、
+    これは実際のページパスと一致しない汎用的な値であり、この組み合わせだと
+    Yahoo側がstatus=500を返すことを確認した（動作確認済みのユーザー提供コードでは
+    Refererを一切付けておらず、それで正常に取得できている）。
+    そのためYahoo宛だけは_fetch()を経由せず、実ブラウザに近いヘッダー構成・
+    Cookie保持セッションで直接リクエストする。
+    """
+    url = f"https://finance.yahoo.co.jp/quote/{ticker}/history?styl=margin&page={page}"
+    try:
+        r = _yahoo_margin_session.get(url, timeout=20)
+    except Exception as e:
+        print(f"[Yahoo margin] {ticker} page={page}: リクエスト例外 {e}")
+        return pd.DataFrame(columns=MARGIN_COLS), 0
+    if r.status_code != 200:
+        return pd.DataFrame(columns=MARGIN_COLS), r.status_code
+    return _parse_yahoo_margin_table(r.text), r.status_code
+
+
+_yahoo_margin_down_until = None  # この時刻までは即スキップする（Noneなら稼働中とみなす）
+_YAHOO_MARGIN_COOLDOWN_SEC = 600  # 失敗後10分はスキップし、以降は再度試す
 
 def _fetch_yahoo_margin(code: str, pages: int = 3) -> pd.DataFrame:
     """
@@ -893,26 +980,43 @@ def _fetch_yahoo_margin(code: str, pages: int = 3) -> pd.DataFrame:
       取得できないことがあるため明示的に付与する）
     1ページ目だけでは最新〜数週間分しか載らないため、page=1〜pages(既定3)まで
     取得してマージすることで、より広い期間・より新しい行を確実に拾う。
-    IRバンクより更新が早いため、週次信用残の第一取得元として使用する。
+
+    【重要】2026年9月末時点、ユーザー環境ではYahoo!ファイナンスへのアクセスが
+    ネットワーク(IPアドレス)起因とみられる理由で間欠的にブロックされており、
+    ブラウザでの手動閲覧ですら半分程度失敗する状態が確認されている。
+    この状態ではリトライしても大半は無駄になるため、一度失敗したら10分間は
+    Yahooへのアクセス自体をスキップし、無駄な待機・リトライで処理が重くなるのを
+    防ぐ（投資の森・IRバンクなど他ソースの取得は継続する）。Streamlitはプロセスが
+    長時間稼働し続けるため、恒久スキップではなく一定時間後に再試行する。
     """
+    global _yahoo_margin_down_until
+    now = time.time()
+    if _yahoo_margin_down_until and now < _yahoo_margin_down_until:
+        remain = int(_yahoo_margin_down_until - now)
+        print(f"[Yahoo margin] {code}: 直前の失敗によりスキップ（あと約{remain}秒）")
+        return pd.DataFrame(columns=MARGIN_COLS)
+
     base = re.sub(r"\.[A-Z]+$", "", code)
     ticker = code if "." in code else f"{base}.T"
+    time.sleep(1.5)  # 銘柄間のアクセス間隔を確保
 
     frames = []
     for page in range(1, pages + 1):
         df_p, status = _fetch_yahoo_margin_page(ticker, page)
         if df_p.empty and status != 200:
-            # .Tなしのコードでも試す（1ページ目失敗時のみ）
+            # .Tなしのコードでも試す（1ページ目失敗時のみ、1回だけ）
             if page == 1:
+                time.sleep(1.5)
                 df_p, status = _fetch_yahoo_margin_page(base, page)
             if df_p.empty:
                 print(f"[Yahoo margin] {code} page={page}: status={status}")
+                _yahoo_margin_down_until = time.time() + _YAHOO_MARGIN_COOLDOWN_SEC
                 break
         if df_p.empty:
             print(f"[Yahoo margin] {code} page={page}: 0件（打ち切り）")
             break
         frames.append(df_p)
-        time.sleep(0.3)  # 連続アクセス間隔を空ける
+        time.sleep(2.0)  # 連続アクセス間隔を空ける（ユーザー検証コードのSLEEP_SECに合わせる）
 
     if not frames:
         return pd.DataFrame(columns=MARGIN_COLS)
@@ -941,39 +1045,76 @@ def _merge_margin(df_base: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFrame:
 
 def fetch_margin(code) -> pd.DataFrame:
     """
-    週次信用残取得。
+    信用残取得。
 
-    【2026年8月時点の状況】
-    - nikkeiyosoku.com（投資の森）: stock(_etf)/margin/{code}/ ページが静的HTMLで
-      直近データ（当該週の金曜時点）まで確実に取得可能。これを第一ソースとする。
-    - IRバンク(irbank.net/{code}/margin): 静的HTMLで取得可能だが反映がやや遅いため、
-      投資の森が取得できなかった場合の保険として残す。
-    - Yahoo Finance: 信用残時系列タブがクライアント側JS描画のため通常は取得不可。
-    - 株探(kabutan.jp): 週次信用残時系列データが株探プレミアム会員限定のため通常は取得不可。
-      （Yahoo/株探は将来的に静的取得が復活した場合に備え、保険的に最後に試す）
+    【重要】東証は2026年9月28日(月)より、信用取引残高（買い残・売り残）の公表を
+    従来の「週1回（金曜時点・翌週火曜発表）」から「毎営業日（前営業日終値時点・翌営業日発表）」
+    に変更した（信用取引残高集計システムのリプレースに伴う恒久的な仕様変更）。
+    この移行直後は情報サイトごとに新形式への追従タイミングがバラつき、
+    サイトによっては旧・週次データのまま更新が止まっている場合がある
+    （投資の森は本対応時点で2026/9/11以降が未更新、との報告あり）。
+
+    そのため「最初に成功したソースをそのまま採用し、他ソースは一切試さない」という
+    従来方式ではなく、取得できる全ソースを取得したうえで日付ごとにマージし、
+    どのソースが一番早く新形式（日次）に対応しても自動的にその最新日を拾えるようにする。
+    同じ日付が複数ソースに存在する場合は、ソース優先順位（Yahoo Finance > 投資の森 >
+    IRバンク）の先勝ちで値を採用する。
+
+    2026/9時点でYahoo Finance（styl=marginページ）が日次データまで取得できることを
+    確認済みのため最優先ソースとする。投資の森・IRバンクは移行対応が遅れているが、
+    過去データの補完や将来的な冗長性確保のため引き続きマージ対象に含める。
+    株探は週次信用残データが引き続き株探プレミアム会員限定のため、
+    他が全滅した場合のみの最終手段として残す。
     """
-    df = _fetch_nikkeiyosoku_margin(code)
-    if not df.empty:
-        print(f"[{code}] 信用残(投資の森): {len(df)}件 最新{df['_dt'].max():%Y/%m/%d}")
-        return df
+    def _try(name, fetcher):
+        try:
+            df_s = fetcher(code)
+        except Exception as e:
+            print(f"[{code}] 信用残({name}): 例外発生 {e}")
+            return None
+        if not df_s.empty:
+            print(f"[{code}] 信用残({name}): {len(df_s)}件 最新{df_s['_dt'].max():%Y/%m/%d}")
+            return df_s
+        return None
 
-    df = _fetch_irbank_margin(code)
-    if not df.empty:
-        print(f"[{code}] 信用残(IRバンク): {len(df)}件 最新{df['_dt'].max():%Y/%m/%d}")
-        return df
+    sources = []
+    # 常時: Yahoo Financeを最優先に、投資の森・IRバンクも合わせて取得しマージする
+    for name, fetcher in [("Yahoo Finance", _fetch_yahoo_margin),
+                          ("投資の森",     _fetch_nikkeiyosoku_margin),
+                          ("IRバンク",     _fetch_irbank_margin)]:
+        df_s = _try(name, fetcher)
+        if df_s is not None:
+            sources.append((name, df_s))
 
-    df_yahoo = _fetch_yahoo_margin(code)  # page 1〜3をマージ済み
-    if not df_yahoo.empty:
-        print(f"[{code}] 信用残(Yahoo Finance): {len(df_yahoo)}件 最新{df_yahoo['_dt'].max():%Y/%m/%d}")
-        return df_yahoo
+    # 上記が全て空の場合のみ、株探を保険的に追加で試す
+    # （プレミアム会員限定のため通常は失敗するが、念のための最終手段として残す）
+    if not sources:
+        df_s = _try("株たん", _fetch_shintan_margin)
+        if df_s is not None:
+            sources.append(("株たん", df_s))
 
-    df_kabutan = _fetch_shintan_margin(code)
-    if not df_kabutan.empty:
-        print(f"[{code}] 信用残(株たん): {len(df_kabutan)}件 最新{df_kabutan['_dt'].max():%Y/%m/%d}")
-        return df_kabutan
+    if not sources:
+        print(f"[{code}] 信用残: 全ソースで取得失敗")
+        return pd.DataFrame(columns=MARGIN_COLS)
 
-    print(f"[{code}] 信用残: 全ソースで取得失敗")
-    return pd.DataFrame(columns=MARGIN_COLS)
+    merged = {}
+    for _, df_s in sources:  # 優先順位順にマージ（先に入れたソースの値を優先）
+        for _, row in df_s.iterrows():
+            key = row["_dt"]
+            if key not in merged:
+                merged[key] = row.to_dict()
+
+    df = pd.DataFrame(list(merged.values()))
+    for c in ["買い残高", "買い増減", "売り残高", "売り増減", "信用倍率"]:
+        df[c] = pd.to_numeric(df.get(c), errors="coerce")
+    df = df.sort_values("_dt").reset_index(drop=True)
+    df["買い残増減率"] = df["買い残高"].pct_change() * 100
+    df["売り残増減率"] = df["売り残高"].pct_change() * 100
+
+    latest_src = max(sources, key=lambda t: t[1]["_dt"].max())[0]
+    print(f"[{code}] 信用残(マージ): {len(df)}件 最新{df['_dt'].max():%Y/%m/%d}"
+          f"（最新日を提供したソース: {latest_src}）")
+    return df
 
 # ════════════════════════════════════════
 # 価格 DataFrame 正規化（共通処理）
