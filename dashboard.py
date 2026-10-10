@@ -11,7 +11,8 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scraper import (fetch_one, fetch_price_by_url, fetch_price_long,
-                     calc_technicals, STOCKS, _safe_int_fmt, SHORT_TOPN)
+                     calc_technicals, STOCKS, _safe_int_fmt, SHORT_TOPN,
+                     estimate_margin_from_lending)
 import socket, re, json, os, requests as _requests
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -1249,6 +1250,60 @@ def render_technical_section(code, info, col_hex, period_days):
                 use_container_width=True,hide_index=True,
                 height=min(38*(len(df_cmp)+1)+38,420))
 
+def build_margin_estimate_view(est, dv_avg, avail_cols):
+    """
+    estimate_margin_from_lending の結果から、②テーブル最上段に出す「予測行」と説明文を作る。
+    戻り値: (予測行dict または None, 説明文)
+    """
+    if not est or est.get("status") in (None, "no_data"):
+        return None, ""
+    if est["status"] == "no_target":
+        return None, "🔮 予測: 貸借に信用残より新しい日がないため、予測対象はありません（信用残は貸借と同じ日まで確定済み）。"
+    if est["status"] == "no_base":
+        return None, "🔮 予測: 信用残の最新確定日に対応する貸借データが無いため予測できません（貸借データの蓄積が進むと表示されます）。"
+
+    tgt=est["target_date"]; base=est["base_date"]
+    sd=est.get("sides",{}); b=sd.get("買い",{}); s=sd.get("売り",{})
+    notes=[f"🔮 **予測行（試算）**: 貸借の{tgt:%Y/%m/%d}分から、まだ公表されていない信用残を推定（基準＝{base:%Y/%m/%d}の確定値）。"]
+    def side_text(name, lab, i):
+        if "pred" not in i:
+            return f"- {name}: 貸借と信用の重なり日が **{i.get('n',0)}/{i.get('min_pairs',8)}日**。{i.get('min_pairs',8)}日以上たまると表示されます。"
+        t=(f"- {name}: 貸借が1株増えると信用が約 **{i['beta']:.2f}株** 増える関係（相関 r={i['r']:.2f}、{i['n']}日分）")
+        bt=i.get("bt")
+        if bt:
+            t+=(f"／過去検証 {bt['n']}日: 平均誤差 {bt['mape_model']:.2f}%"
+                f"（何もしない予測 {bt['mape_naive']:.2f}%）→ "
+                + (f"**貸借で誤差が{bt['improve']*100:.0f}%減**" if bt['improve']>0 else "**貸借に予測力は確認できず**"))
+        else:
+            t+="／過去検証はデータ不足"
+        if pd.notna(i.get("pred_ratio")):
+            t+=f"／比率法(参考) {i['pred_ratio']:,.0f}"
+        return t
+    notes.append(side_text("買い(融資→信用買い残)","買い",b))
+    notes.append(side_text("売り(貸株→信用売り残)","売り",s))
+    n_min=min([x.get("n",0) for x in (b,s) if "pred" in x] or [0])
+    if 0<n_min<20: notes.append("⚠️ サンプルが20日未満のため参考程度です（数ヶ月分たまると精度の確認ができます）。")
+
+    if "pred" not in b and "pred" not in s:
+        return None, "  \n".join(notes)
+
+    pb=b.get("pred"); ps=s.get("pred"); bb=b.get("base"); sb=s.get("base")
+    row={c:"-" for c in avail_cols}
+    row["日付"]=f"【予測】{tgt:%Y/%m/%d}"
+    if pb is not None:
+        row["買い残高"]=fmt(pb); row["買い増減"]=fmt(pb-bb)
+        row["買い残増減率"]=f"{(pb/bb-1)*100:+.2f}%" if bb else "-"
+        if dv_avg and "買い残消化日数" in row: row["買い残消化日数"]=f"{pb/dv_avg:.1f}日"
+    if ps is not None:
+        row["売り残高"]=fmt(ps); row["売り増減"]=fmt(ps-sb)
+        row["売り残増減率"]=f"{(ps/sb-1)*100:+.2f}%" if sb else "-"
+        if dv_avg and "売り残消化日数" in row: row["売り残消化日数"]=f"{ps/dv_avg:.1f}日"
+    if pb is not None and ps is not None:
+        if ps>0: row["信用倍率"]=f"{pb/ps:.2f}倍"
+        if dv_avg and "信用需給ネット" in row: row["信用需給ネット"]=f"{(pb-ps)/dv_avg:+.1f}日"
+    return row, "  \n".join(notes)
+
+
 # ════════════════════════════════════════
 # 銘柄描画関数
 # ════════════════════════════════════════
@@ -1291,8 +1346,17 @@ def render_stock(code, info, col_hex):
     render_ai_summary(code, info, period_label=period_label)
 
     # ① 貸借取引残高
+    # 蓄積データは長期になるため、表示は選択期間で絞る（前日比%の計算は全期間のL_fullで行う）
+    L_full=L
+    if (not L.empty) and period_days>0:
+        L=L[L["_dt"]>=datetime.today()-timedelta(days=period_days)].reset_index(drop=True)
     if not L.empty:
         st.markdown("**① 貸借取引残高 + 逆日歩**")
+        st.caption(f"💾 蓄積データ: {len(L_full)}日分（{L_full['_dt'].min():%Y/%m/%d}～{L_full['_dt'].max():%Y/%m/%d}）"
+                   f"／表示中 {len(L)}日分（取得のたびに追記・同じ日付は上書きで二重になりません）")
+        st.download_button("⬇️ ①貸借データをCSVで保存（蓄積全期間）",
+            L_full.drop(columns=["_dt"]).to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"lending_{code}.csv", mime="text/csv", key=f"dl_lend_{code}")
         La=L.sort_values("_dt",ascending=True)
         fig1=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.65,0.35],
             vertical_spacing=0.05,
@@ -1334,10 +1398,12 @@ def render_stock(code, info, col_hex):
         # 前日比%は「増減」列（一部ソースでは未提供のため直近日が欠損しがち）に依存せず、
         # 残高同士の日次変化率（pct_change）から直接算出する。①はtaisyaku.jp/IRバンクいずれも
         # 日次データのため、週次信用残(②)とは無関係に計算される。
-        La_asc=L.sort_values("_dt",ascending=True).reset_index(drop=True)
-        La_asc["融資増減率"]=La_asc["買い残高"].pct_change()*100
-        La_asc["貸株増減率"]=La_asc["売り残高"].pct_change()*100
+        La_asc=L_full.sort_values("_dt",ascending=True).reset_index(drop=True)
+        La_asc["融資増減率"]=La_asc["買い残高"].pct_change(fill_method=None)*100
+        La_asc["貸株増減率"]=La_asc["売り残高"].pct_change(fill_method=None)*100
         Ld=La_asc.sort_values("_dt",ascending=False).reset_index(drop=True)
+        if period_days>0:   # 期間外の行は表示から除く（増減率は期間外の前日も使って計算済み）
+            Ld=Ld[Ld["_dt"]>=datetime.today()-timedelta(days=period_days)].reset_index(drop=True)
 
         dp=pd.DataFrame(); dp["申込日"]=Ld["申込日"]
         for src,disp in SRC2DISP.items():
@@ -1378,6 +1444,11 @@ def render_stock(code, info, col_hex):
     # ② 週次信用残（グラフ削除・テーブルのみ）
     if not M.empty:
         st.markdown("**② 週次信用残**")
+        st.caption(f"💾 蓄積データ: {len(M)}日分（{M['_dt'].min():%Y/%m/%d}～{M['_dt'].max():%Y/%m/%d}）"
+                   "／2026/9/25以降は日次、それ以前は週次データです（取得のたびに追記・同じ日付は上書きで二重になりません）")
+        st.download_button("⬇️ ②信用残データをCSVで保存（蓄積全期間）",
+            M.drop(columns=["_dt"]).to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"margin_{code}.csv", mime="text/csv", key=f"dl_margin_{code}")
         dv_avg=P["出来高"].mean() if not P.empty and "出来高" in P.columns else None
         MCOLS=["日付","買い残高","買い残消化日数","買い増減","売り残高","売り残消化日数",
                "売り増減","信用需給ネット","信用倍率","買い残増減率","売り残増減率","逆日歩"]
@@ -1415,13 +1486,25 @@ def render_stock(code, info, col_hex):
             av_m["信用需給ネット"]=f"{Md['信用需給ネット_n'].mean(skipna=True):+.1f}日"
         avail_mcols=[c for c in MCOLS if c in dm.columns]
         disp_m=pd.concat([dm[avail_mcols],pd.DataFrame([{c:av_m.get(c,"") for c in avail_mcols}])],ignore_index=True)
+
+        # 貸借(当日夜に判明)から、まだ未公表の当日の信用残を試算して最上段に出す
+        try:
+            est_m=estimate_margin_from_lending(L_full,M)
+            pred_row,pred_note=build_margin_estimate_view(est_m,dv_avg,avail_mcols)
+        except Exception as e:
+            pred_row,pred_note=None,f"🔮 予測の計算でエラーが発生しました: {e}"
+        if pred_row:
+            disp_m=pd.concat([pd.DataFrame([pred_row]),disp_m],ignore_index=True)
         st_m=cell_style(disp_m,Md,"日付",MNUM,thr=3.0)
+        if pred_row:
+            st_m.iloc[0,:]="background-color:#12263f;color:#79c0ff;font-weight:700"
         st.dataframe(disp_m.style.apply(lambda _:st_m,axis=None),
             use_container_width=True,hide_index=True,height=min(38*(len(disp_m)+1)+38,480))
         st.caption(
             "📌 **信用需給ネット** = 買い残高÷日次平均出来高（日）－ 売り残高÷日次平均出来高（日）  \n"
             "プラス＝買い残が厚い（上昇余地・需給重い両面あり）/ マイナス＝売り残が厚い（下落圧力・買い戻し余地）"
             + (f"  ※出来高平均={dv_avg/1e6:.1f}M" if dv_avg else ""))
+        if pred_note: st.caption(pred_note)
     else:
         st.info("② 週次信用残データなし")
 
