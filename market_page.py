@@ -15,11 +15,15 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 import market as M
+import ui
 
 POS, NEG = "#58a6ff", "#f85149"            # 通常行：プラス=青 / マイナス=赤（株価テーブルと同じ）
 POS_ON_BLUE, NEG_ON_BLUE = "#bfe0ff", "#ff9d97"   # 青背景の行では読みやすい明るめの色にする
-LEVEL_BG = {1: "#12304f", 2: "#1558a8", 3: "#2236d6"}   # 薄青 < 濃青 < 最濃青
-LEVEL_TXT = {1: "#c9d1d9", 2: "#ffffff", 3: "#ffffff"}
+LEVEL_BG = {1: "#12304f", 2: "#1558a8", 3: "#2236d6",   # 薄青 < 濃青 < 最濃青
+            4: "#7a2fb5",                               # 紫：赤と青の条件が同じ日に重なった行
+            5: "#a11f2e",                               # 赤
+            6: "#1d7fc4"}                               # 青（好景気）：評価損益率が −3% 以上（含み損3%以下）                               # 赤：VIXゴールデンクロス日 / 評価損益率がしきい値超え
+LEVEL_TXT = {1: "#c9d1d9", 2: "#ffffff", 3: "#ffffff", 4: "#ffffff", 5: "#ffffff", 6: "#ffffff"}
 PERIODS = {"1ヶ月": 31, "3ヶ月": 92, "6ヶ月": 183, "1年": 366, "2年": 731, "5年": 1827, "全期間": 0}
 DEFAULT_CMP = "1570"
 REFRESH_SEC = 3600                          # 起動中、この間隔より古ければ自動で取り直す
@@ -112,7 +116,7 @@ def _styler(disp: pd.DataFrame, levels: np.ndarray):
             lv = int(lv)
             if lv:
                 out.iloc[i, :] = f"background-color:{LEVEL_BG[lv]};color:{LEVEL_TXT[lv]}"
-                if lv == 3:
+                if lv >= 3:
                     out.iloc[i, :] += ";font-weight:700"
             for c in SIGNED:
                 v = disp.iloc[i][c]
@@ -130,14 +134,17 @@ def _styler(disp: pd.DataFrame, levels: np.ndarray):
     return sty
 
 
-def _legend(sell_thr, short_thr):
+def _legend(sell_thr, short_thr, pl_thr, plb_thr):
     sw = lambda c, t: (f"<span style='display:inline-block;width:14px;height:14px;background:{c};"
                        f"border:1px solid #484f58;vertical-align:middle;margin-right:4px'></span>{t}")
     st.markdown(
         "<div style='font-size:12px;color:#8b949e'>"
         + sw(LEVEL_BG[1], f"薄青：①売り残金額 &gt; {sell_thr:,.0f}億円") + "　"
         + sw(LEVEL_BG[2], f"濃青：上記 かつ 空売り比率 ≥ {short_thr:g}%") + "　"
-        + sw(LEVEL_BG[3], "最濃青：VIXのMACDがデッドクロス（最優先）") + "　"
+        + sw(LEVEL_BG[3], "最濃青：VIXのMACDがデッドクロス") + "　"
+        + sw(LEVEL_BG[5], f"赤：VIXのMACDがゴールデンクロス／評価損益率 &lt; −{pl_thr:g}%（含み損が{pl_thr:g}%超）") + "　"
+        + sw(LEVEL_BG[6], f"青：評価損益率 ≥ −{plb_thr:g}%（含み損{plb_thr:g}%以下＝好景気）") + "　"
+        + sw(LEVEL_BG[4], "紫：赤と青の条件が重なった日") + "　"
         + f"<span style='color:{POS}'>青字=プラス</span> / <span style='color:{NEG}'>赤字=マイナス</span>"
         + "</div>", unsafe_allow_html=True)
 
@@ -147,9 +154,9 @@ def _legend(sell_thr, short_thr):
 # ────────────────────────────────────────────
 def render():
     st.markdown(_CSS, unsafe_allow_html=True)
-    st.markdown("<h2 style='text-align:center;color:#f0f6fc;font-size:20px;margin:4px 0'>"
-                "🌐 市場全体 ― 信用需給 × VIX</h2>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align:center;color:#8b949e;font-size:11px;margin:0 0 8px'>"
+    ui.inject()
+    ui.title("🌐 市場全体", "信用需給 × VIX ― 今日の現在地")
+    st.markdown("<p style='color:#8b949e;font-size:11px;margin:0 0 8px'>"
                 "出典：nikkei225jp.com（週次信用評価損益・空売り比率・VIX）/ JPX 銘柄別信用取引残高（日次）/ 株探（VIX代替）"
                 "</p>", unsafe_allow_html=True)
 
@@ -169,6 +176,8 @@ def render():
         a, b, c = st.columns(3)
         sell_thr = a.number_input("売り残金額のしきい値（億円・①一般+制度）", value=8000.0, step=100.0, key="mkt_sell_thr")
         short_thr = b.number_input("空売り比率合計のしきい値（%）", value=40.0, step=1.0, key="mkt_short_thr")
+        pl_thr = st.number_input("評価損益率の含み損しきい値（%・マイナスがこれを超える日を赤）", value=10.0, step=1.0, key="mkt_pl_thr")
+        plb_thr = st.number_input("評価損益率の含み損しきい値（%・これ以下の日を青＝好景気）", value=3.0, step=1.0, key="mkt_plb_thr")
         shift = c.checkbox("VIXを日本の翌営業日にずらす（米国終値→日本市場への反映日）", value=False, key="mkt_shift")
 
     if data["weekly"].empty and data["jpx1"].empty:
@@ -177,9 +186,12 @@ def render():
     build = M.build_tables(data, shift_vix=shift)
     t1, t2, macd = build["t1"], build["t2"], build["macd"]
     lv_all = M.row_levels(t1, sell_thr, short_thr)
+    red_all = ((t1["cross"] == "GC") | (t1["pl"] < -pl_thr)) if (t1 is not None and not t1.empty) else pd.Series(dtype=bool)
 
-    # ── 概況 ───────────────────────────────
-    _summary(t1, macd, ss.get("mkt_prov"))
+    plb_all = (t1["pl"] >= -plb_thr) if (t1 is not None and not t1.empty) else pd.Series(dtype=bool)
+
+    # ── 概況（今日の数字 ＋ 平均）───────────────
+    _summary(t1, macd, ss.get("mkt_prov"), data, sell_thr, short_thr, pl_thr, plb_thr)
 
     tab_t, tab_c = st.tabs(["📋 需給テーブル", "📈 VIX × 株価 × 信用需給チャート"])
 
@@ -187,12 +199,12 @@ def render():
         return t[t.index >= cutoff] if (cutoff is not None and not t.empty) else t
 
     with tab_t:
-        _legend(sell_thr, short_thr)
-        st.markdown("**① 一般信用 + 制度信用**（週次＝日経の表をそのまま／日次＝JPX。同じ日付は週次を優先）")
-        _show_table(cut(t1), lv_all, "mkt_t1", "market_overall_1")
-        st.markdown("**② 制度信用のみ**（日次・JPX）")
+        _legend(sell_thr, short_thr, pl_thr, plb_thr)
+        ui.section("① 一般信用 ＋ 制度信用", "週次＝日経の表をそのまま／日次＝JPX。同じ日付は週次を優先")
+        _show_table(cut(t1), lv_all, red_all, plb_all, "mkt_t1", "market_overall_1")
+        ui.section("② 制度信用のみ", "日次・JPX")
         st.caption("行の色は同じ日付の①の判定（売り残金額・空売り比率）とVIXクロスに連動します。評価損益率は日次では算出できないため空欄です。")
-        _show_table(cut(t2), lv_all, "mkt_t2", "market_overall_2")
+        _show_table(cut(t2), lv_all, red_all, plb_all, "mkt_t2", "market_overall_2")
         st.caption(
             "※ 日次の『変化(金額%)』はJPXの前日比、週次はひとつ前の週次との比です。"
             "※ 週次(日経: 東証+名証)と日次(JPX: 東証のみ)は対象が少し違うため、切替日に0.1%前後の段差が出ます。"
@@ -204,43 +216,66 @@ def render():
     _status(data, ss.get("mkt_msgs", []))
 
 
-def _show_table(t, lv_all, key, fname):
+def _show_table(t, lv_all, red_all, plb_all, key, fname):
     if t is None or t.empty:
         st.info("表示できるデータがありません。")
         return
     disp = _display(t)
     levels = lv_all.reindex(t.index).fillna(0).values
-    levels = np.where(t["cross"].values == "DC", 3, levels)
+    levels = np.where(t["cross"].values == "DC", 3, levels).astype(int)
+    red = (red_all.reindex(t.index).fillna(False).values.astype(bool) | (t["cross"].values == "GC"))
+    plb = plb_all.reindex(t.index).fillna(False).values.astype(bool)
+    blue_any = (levels > 0) | plb
+    levels = np.where(levels > 0, levels, np.where(plb, 6, 0))            # 青は他の青条件があればそちらを優先
+    levels = np.where(red & blue_any, 4, np.where(red, 5, levels))        # 赤×青の重複は紫
     st.dataframe(_styler(disp, levels), use_container_width=True, hide_index=True,
                  height=min(38 * (len(disp) + 1) + 3, 520))
     st.download_button("⬇️ CSV", disp.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"{fname}.csv", mime="text/csv", key=f"{key}_dl")
 
 
-def _summary(t1, macd, prov):
-    cols = st.columns(5)
+def _summary(t1, macd, prov, data, sell_thr, short_thr, pl_thr, plb_thr):
+    """今日の数字（大）＋ 平均 ＋ 差。色の条件は表と同じ定義。"""
+    BLUE = "background:#1558a8;color:#fff"
+    RED = "background:#a11f2e;color:#fff"
+    DEEP = "background:#2236d6;color:#fff"
     if t1 is not None and not t1.empty:
         r = t1.iloc[0]
-        cols[0].metric("最新（①合算）", t1.index[0].strftime("%m/%d") + f"（{r['kind']}）")
-        cols[1].metric("信用倍率", f"{r['ratio']:.2f}")
-        cols[2].metric("売り残", f"{r['sell_k']:,.0f}億円")
-        if pd.notna(r.get("short")):
-            cols[3].metric("空売り比率合計", f"{r['short']:.1f}%")
+        ui.group(f"▼ 最新（①一般+制度）　{t1.index[0].strftime('%Y/%m/%d')}（{r['kind']}）　※平均は蓄積した全期間")
         wk = t1[t1["kind"] == "週次"]
+        items = [
+            ui.stat("信用倍率（金額）", r["ratio"], t1["ratio"].mean(), dec=2, accent="#e3b341"),
+            ui.stat("売り残（億円）", r["sell_k"], t1["sell_k"].mean(), dec=0, accent="#f85149",
+                    badge=(f"{sell_thr:,.0f}億円超" if r["sell_k"] > sell_thr else None), badge_style=BLUE),
+            ui.stat("空売り比率合計（%）", r.get("short"), t1["short"].mean(), dec=1, accent="#bc8cff",
+                    badge=(f"{short_thr:g}%以上" if pd.notna(r.get("short")) and r["short"] >= short_thr else None),
+                    badge_style=DEEP),
+        ]
         if not wk.empty and pd.notna(wk.iloc[0]["pl"]):
-            cols[4].metric(f"評価損益率（週次 {wk.index[0].strftime('%m/%d')}）", f"{wk.iloc[0]['pl']:+.2f}%")
-    if macd is not None and not macd.empty:
-        last = macd.iloc[-1]
-        state = "MACD＞シグナル（上向き）" if last["hist"] > 0 else "MACD＜シグナル（下向き）"
-        ev = macd[macd["cross"] != ""]
-        ev_txt = ""
-        if not ev.empty:
-            e = ev.iloc[-1]
-            ev_txt = f"　直近クロス: {'デッド' if e['cross'] == 'DC' else 'ゴールデン'} {ev.index[-1].strftime('%m/%d')}"
-        msg = f"VIX {last['c']:.2f}（{macd.index[-1].strftime('%m/%d')}確定）｜{state}{ev_txt}"
-        if prov and prov[0]:
-            msg += f"｜暫定 {prov[1]:.2f}（{prov[0][5:].replace('-', '/')}米国取引中・MACD計算には未使用）"
-        st.caption("🌡️ " + msg)
+            v = wk.iloc[0]["pl"]
+            bd, bs = (None, None)
+            if v < -pl_thr:
+                bd, bs = f"含み損{pl_thr:g}%超（下落基調）", RED
+            elif v >= -plb_thr:
+                bd, bs = f"含み損{plb_thr:g}%以下（好景気）", "background:#1d7fc4;color:#fff"
+            items.append(ui.stat(f"評価損益率（週次 {wk.index[0].strftime('%m/%d')}）", v, wk["pl"].mean(),
+                                 dec=2, suffix="%", sign=True, accent="#58a6ff", badge=bd, badge_style=bs,
+                                 val_color=(NEG if v < 0 else POS)))
+        vix = data.get("vix")
+        if macd is not None and not macd.empty:
+            last = macd.iloc[-1]
+            ev = macd[macd["cross"] != ""]
+            note = "MACD＞シグナル（上向き）" if last["hist"] > 0 else "MACD＜シグナル（下向き）"
+            bd = bs = None
+            if not ev.empty:
+                e, d_ = ev.iloc[-1]["cross"], ev.index[-1].strftime("%m/%d")
+                bd = f"直近 {'デッドクロス' if e == 'DC' else 'ゴールデンクロス'} {d_}"
+                bs = DEEP if e == "DC" else RED
+            if prov and prov[0]:
+                note += f"<br>暫定 {prov[1]:.2f}（{prov[0][5:].replace('-', '/')}米国取引中）"
+            items.append(ui.stat(f"VIX（{macd.index[-1].strftime('%m/%d')}確定）", last["c"], macd["c"].mean(), dec=2,
+                                 accent="#f0883e", note=note, badge=bd, badge_style=bs))
+        ui.card_row(items)
 
 
 # ────────────────────────────────────────────

@@ -14,6 +14,7 @@ from scraper import (fetch_one, fetch_price_by_url, fetch_price_long,
                      calc_technicals, STOCKS, _safe_int_fmt, SHORT_TOPN,
                      estimate_margin_from_lending)
 import socket, re, json, os, requests as _requests
+import ui, stock_view
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -632,6 +633,14 @@ def render_seido_chart(code, info, Pa, period_days):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _finite(obj, col=None):
+    """平均値（NaN・無限大を除く）。KPIボード用。"""
+    if col is not None and col not in obj.columns:
+        return None
+    sr = obj[col] if col is not None else obj
+    sr = pd.to_numeric(sr, errors="coerce").replace([float("inf"), float("-inf")], float("nan")).dropna()
+    return float(sr.mean()) if len(sr) else None
+
 def render_technical_section(code, info, col_hex, period_days):
     st.markdown("**③ 株価急変 ＋ テクニカル分析 ＋ 信用残連動 ＋ 比較分析**")
 
@@ -1099,6 +1108,23 @@ def render_technical_section(code, info, col_hex, period_days):
     # ══ 降順変換 ════════════════════════════════════
     Pa_desc2 = Pa_asc.sort_values("_dt", ascending=False).reset_index(drop=True)
 
+    # 個別銘柄ページ上部のKPIボード用に、当日の判定結果（この表と同じ定義）を保存する
+    try:
+        _r0 = Pa_desc2.iloc[0]
+        _g = lambda k: (None if (k not in Pa_desc2.columns or pd.isna(_r0[k])) else float(_r0[k]))
+        st.session_state[f"tech_latest_{code}"] = {
+            "date": str(_r0.get("日付", "")),
+            "close": _g("終値"), "chg": _g("前日比%"), "dev25": _g("25日乖離率"), "rsi": _g("RSI"),
+            "macd_hist": _g("MACD_hist"), "vol": _g("出来高"), "vm": float(vm_p),
+            "tr_up": bool(_r0.get("TR_up", False)), "tr_dn": bool(_r0.get("TR_dn", False)),
+            "trend": str(_r0.get("トレンド", "") or ""),
+            "inst": bool(_r0.get("機関異常_p", False)), "volabn": bool(_r0.get("出来高異常_p", False)),
+            "avg": {"close": _finite(Pa_asc, "終値"), "chg_abs": _finite(Pa_asc["前日比%"].abs()) if "前日比%" in Pa_asc.columns else None,
+                    "dev25": _finite(Pa_asc, "25日乖離率"), "rsi": _finite(Pa_asc, "RSI")},
+        }
+    except Exception as _e:
+        st.session_state.pop(f"tech_latest_{code}", None)
+
     # ══ テーブル構築 ════════════════════════════════
     # 選択テクニカル列（ただし後で固定順で配置するため収集のみ）
     sel_tech = []
@@ -1430,11 +1456,7 @@ def render_stock(code, info, col_hex):
         st.session_state.stock_data[code] = info
 
 
-    st.markdown(f"""<div style="background:#161b22;border-left:4px solid {prc};
-        border-radius:6px;padding:10px 14px;margin-bottom:12px">
-      <span style="font-size:1.05rem;font-weight:700;color:{prc}">{pr['label']}</span>
-      <span style="color:#8b949e;font-size:0.82rem;margin-left:10px">{pr['detail']}</span>
-    </div>""", unsafe_allow_html=True)
+    hdr = st.container()   # 頭のKPIボード（下のタブを描画したあとで埋める）
 
     # ── 表示期間選択 ─────────────────────────────
     period_key=f"period_{code}"
@@ -1450,246 +1472,253 @@ def render_stock(code, info, col_hex):
         d_min=p_long["_dt"].min(); d_max=p_long["_dt"].max()
         st.caption(f"📂 長期データ: {len(p_long)}営業日 / {d_min.strftime('%Y/%m/%d')} ～ {d_max.strftime('%Y/%m/%d')}")
 
-    # ── AI要約（period_label定義後に呼ぶ）────────
-    render_ai_summary(code, info, period_label=period_label)
+    tab_cmp, tab_tech, tab_inst, tab_ai = st.tabs(["⚖️ 需給比較", "📈 株価・テクニカル", "🏦 空売り機関", "🤖 AI要約"])
+    with tab_ai:
+        render_ai_summary(code, info, period_label=period_label)
 
-    # ① 貸借取引残高
     # 蓄積データは長期になるため、表示は選択期間で絞る（前日比%の計算は全期間のL_fullで行う）
     L_full=L
     if (not L.empty) and period_days>0:
         L=L[L["_dt"]>=datetime.today()-timedelta(days=period_days)].reset_index(drop=True)
-    if not L.empty:
-        st.markdown("**① 貸借取引残高 + 逆日歩**")
-        st.caption(f"💾 蓄積データ: {len(L_full)}日分（{L_full['_dt'].min():%Y/%m/%d}～{L_full['_dt'].max():%Y/%m/%d}）"
-                   f"／表示中 {len(L)}日分（取得のたびに追記・同じ日付は上書きで二重になりません）")
-        st.download_button("⬇️ ①貸借データをCSVで保存（蓄積全期間）",
-            L_full.drop(columns=["_dt"]).to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"lending_{code}.csv", mime="text/csv", key=f"dl_lend_{code}")
-        La=L.sort_values("_dt",ascending=True)
-        fig1=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.65,0.35],
-            vertical_spacing=0.05,
-            subplot_titles=["融資残高・貸株残高＋株価（右軸）","資金フロー（融資新規－貸株新規）"],
-            specs=[[{"secondary_y":True}],[{"secondary_y":False}]])
-        # 文字列の日付(申込日)ではなく実際のdatetime(_dt)をx軸に使う。
-        # 融資/貸株残高(日次・約35日分)と株価を同じ文字列カテゴリ軸で重ねると、
-        # 両者の日付集合が完全一致しない場合に軸がずれて破綻するため。
-        fig1.add_trace(go.Scatter(x=La["_dt"],y=La["買い残高"],name="融資残高",
-            line=dict(color="#388bfd",width=2),fill="tozeroy",fillcolor="rgba(56,139,253,0.08)",
-            hovertemplate="%{x|%Y/%m/%d}<br>融資残高:%{y:,.0f}<extra></extra>"),
-            row=1,col=1,secondary_y=False)
-        fig1.add_trace(go.Scatter(x=La["_dt"],y=La["売り残高"],name="貸株残高",
-            line=dict(color="#f85149",width=2),fill="tozeroy",fillcolor="rgba(248,81,73,0.08)",
-            hovertemplate="%{x|%Y/%m/%d}<br>貸株残高:%{y:,.0f}<extra></extra>"),
-            row=1,col=1,secondary_y=False)
-        if not P.empty:
-            Pa2=P.sort_values("_dt",ascending=True)
-            fig1.add_trace(go.Scatter(x=Pa2["_dt"],y=Pa2["終値"],name="株価",
-                line=dict(color="#e3b341",width=1.5,dash="dot"),
-                hovertemplate="%{x|%Y/%m/%d}<br>¥%{y:,.1f}<extra></extra>"),row=1,col=1,secondary_y=True)
-            fig1.update_yaxes(title_text="株価",secondary_y=True,gridcolor="#21262d",
-                tickfont=dict(color="#e3b341",size=9),tickformat=",",row=1,col=1)
-        flow=La["買い新規"].fillna(0)-La.get("売り新規",pd.Series([0]*len(La))).fillna(0)
-        fig1.add_trace(go.Bar(x=La["_dt"],y=flow,name="資金フロー",
-            marker_color=["#388bfd" if v>=0 else "#f85149" for v in flow],opacity=0.85,
-            hovertemplate="%{x|%Y/%m/%d}<br>資金フロー:%{y:,.0f}<extra></extra>"),
-            row=2,col=1)
-        fig1.add_hline(y=0,line_dash="solid",line_color="#484f58",line_width=1,row=2,col=1)
-        fig1.update_xaxes(tickformat="%Y/%m/%d")
-        fig_base(fig1,400); st.plotly_chart(fig1,use_container_width=True)
-
-        LCOLS=["申込日","融資残高","融資残高(対信用比%)","融資増減率（前日比%）","融資新規","融資返済",
-               "貸株残高","貸株残高(対信用比%)","貸株増減率（前日比%）","貸株新規","貸株返済","貸借倍率","逆日歩"]
-        SRC2DISP={"買い残高":"融資残高","買い新規":"融資新規","買い返済":"融資返済",
-                  "売り残高":"貸株残高","売り新規":"貸株新規","売り返済":"貸株返済"}
-        LNUM_SRC=["買い残高","買い新規","買い返済","売り残高","売り新規","売り返済"]
-
-        # 前日比%は「増減」列（一部ソースでは未提供のため直近日が欠損しがち）に依存せず、
-        # 残高同士の日次変化率（pct_change）から直接算出する。①はtaisyaku.jp/IRバンクいずれも
-        # 日次データのため、週次信用残(②)とは無関係に計算される。
-        La_asc=L_full.sort_values("_dt",ascending=True).reset_index(drop=True)
-        La_asc["融資増減率"]=La_asc["買い残高"].pct_change(fill_method=None)*100
-        La_asc["貸株増減率"]=La_asc["売り残高"].pct_change(fill_method=None)*100
-        Ld=La_asc.sort_values("_dt",ascending=False).reset_index(drop=True)
-        if period_days>0:   # 期間外の行は表示から除く（増減率は期間外の前日も使って計算済み）
-            Ld=Ld[Ld["_dt"]>=datetime.today()-timedelta(days=period_days)].reset_index(drop=True)
-
-        dp=pd.DataFrame(); dp["申込日"]=Ld["申込日"]
-        for src,disp in SRC2DISP.items():
-            dp[disp]=Ld[src].apply(fmt) if src in Ld.columns else "-"
-        dp["融資増減率（前日比%）"]=Ld["融資増減率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
-        dp["貸株増減率（前日比%）"]=Ld["貸株増減率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
-        dp["融資残高(対信用比%)"]=Ld["買い残高"].apply(
-            lambda v:f"{float(v)/lmb*100:.1f}%" if pd.notna(v) and lmb and lmb>0 else "-")
-        dp["貸株残高(対信用比%)"]=Ld["売り残高"].apply(
-            lambda v:f"{float(v)/lms*100:.1f}%" if pd.notna(v) and lms and lms>0 else "-")
-        dp["貸借倍率"]=Ld["貸借倍率"].apply(
-            lambda v:"-" if pd.isna(v) else "∞" if abs(v)==float("inf") else f"{v:.2f}倍")
-        dp["逆日歩"]=Ld["逆日歩"].apply(lambda v:f"{v:.2f}" if pd.notna(v) and v>0 else "-")
-        av={c:"" for c in LCOLS}; av["申込日"]="【平均】"
-        for src,disp in SRC2DISP.items(): av[disp]=fmt(Ld[src].mean(skipna=True))
-        av["融資増減率（前日比%）"]=fmt(Ld["融資増減率"].mean(skipna=True),dec=2,suffix="%")
-        av["貸株増減率（前日比%）"]=fmt(Ld["貸株増減率"].mean(skipna=True),dec=2,suffix="%")
-        av["貸借倍率"]=fmt(Ld["貸借倍率"].replace([float("inf"),float("-inf")],float("nan")).mean(skipna=True),dec=2,suffix="倍")
-        av["逆日歩"]=fmt(Ld["逆日歩"].mean(skipna=True),dec=2)
-        avail_lcols=[c for c in LCOLS if c in dp.columns]
-        disp_l=pd.concat([dp[avail_lcols],pd.DataFrame([{c:av.get(c,"") for c in avail_lcols}])],ignore_index=True)
-        # cell_styleは表示dp側の列名で数値着色を行うため、Ld側にも表示名で数値列を複製しておく
-        Ld_style=Ld.rename(columns=SRC2DISP)
-        Ld_style["融資増減率（前日比%）"]=Ld["融資増減率"]
-        Ld_style["貸株増減率（前日比%）"]=Ld["貸株増減率"]
-        LNUM_DISP=[SRC2DISP[c] for c in LNUM_SRC]
-        st_l=cell_style(disp_l,Ld_style,"申込日",LNUM_DISP+["融資増減率（前日比%）","貸株増減率（前日比%）"],neg_red=["差引残高"])
-        for idx in disp_l[disp_l["申込日"]!="【平均】"].index:
-            dv=disp_l.loc[idx,"申込日"]
-            orig=Ld.loc[Ld["申込日"]==dv,"逆日歩"]
-            if not orig.empty and pd.notna(orig.values[0]) and orig.values[0]>0:
-                st_l.loc[idx,"逆日歩"]="background-color:#2d1f00;color:#e3b341;font-weight:700"
-        st.dataframe(disp_l.style.apply(lambda _:st_l,axis=None),
-            use_container_width=True,hide_index=True,height=min(38*(len(disp_l)+1)+38,520))
-    else:
-        st.info("① 貸借データなし")
-
-    # ② 週次信用残（グラフ削除・テーブルのみ）
-    if not M.empty:
-        st.markdown("**② 週次信用残**")
-        st.caption(f"💾 蓄積データ: {len(M)}日分（{M['_dt'].min():%Y/%m/%d}～{M['_dt'].max():%Y/%m/%d}）"
-                   "／2026/9/25以降は日次、それ以前は週次データです（取得のたびに追記・同じ日付は上書きで二重になりません）")
-        st.download_button("⬇️ ②信用残データをCSVで保存（蓄積全期間）",
-            M.drop(columns=["_dt"]).to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"margin_{code}.csv", mime="text/csv", key=f"dl_margin_{code}")
-        dv_avg=P["出来高"].mean() if not P.empty and "出来高" in P.columns else None
-        MCOLS=["日付","買い残高","買い残消化日数","買い増減","売り残高","売り残消化日数",
-               "売り増減","信用需給ネット","信用倍率","買い残増減率","売り残増減率","逆日歩"]
-        MNUM =["買い残高","買い増減","売り残高","売り増減","信用倍率","買い残増減率","売り残増減率"]
-        Md=M.sort_values("_dt",ascending=False).reset_index(drop=True)
-        if dv_avg:
-            Md["買い残消化日数_n"]=Md["買い残高"].apply(
-                lambda v:float(v)/dv_avg if pd.notna(v) and dv_avg else float("nan"))
-            Md["売り残消化日数_n"]=Md["売り残高"].apply(
-                lambda v:float(v)/dv_avg if pd.notna(v) and dv_avg else float("nan"))
-            Md["信用需給ネット_n"]=Md["買い残消化日数_n"]-Md["売り残消化日数_n"]
-        dm=pd.DataFrame(); dm["日付"]=Md["日付"]
-        dm["買い残高"]=Md["買い残高"].apply(fmt)
-        if dv_avg: dm["買い残消化日数"]=Md["買い残消化日数_n"].apply(
-            lambda v:f"{v:.1f}日" if pd.notna(v) else "-")
-        dm["買い増減"]=Md["買い増減"].apply(fmt)
-        dm["売り残高"]=Md["売り残高"].apply(fmt)
-        if dv_avg: dm["売り残消化日数"]=Md["売り残消化日数_n"].apply(
-            lambda v:f"{v:.1f}日" if pd.notna(v) else "-")
-        dm["売り増減"]=Md["売り増減"].apply(fmt)
-        if dv_avg: dm["信用需給ネット"]=Md["信用需給ネット_n"].apply(
-            lambda v:f"{v:+.1f}日" if pd.notna(v) else "-")
-        dm["信用倍率"]=Md["信用倍率"].apply(lambda v:f"{v:.2f}倍" if pd.notna(v) else "-")
-        dm["買い残増減率"]=Md["買い残増減率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
-        dm["売り残増減率"]=Md["売り残増減率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
-        dm["逆日歩"]=Md["逆日歩"].apply(lambda v:f"{v:.2f}" if pd.notna(v) and v>0 else "-")
-        av_m={c:"" for c in MCOLS}; av_m["日付"]="【平均】"
-        for c in ["買い残高","売り残高"]: av_m[c]=fmt(Md[c].mean(skipna=True))
-        av_m["信用倍率"]=fmt(Md["信用倍率"].mean(skipna=True),dec=2,suffix="倍")
-        for c in ["買い残増減率","売り残増減率"]:
-            v2=Md[c].mean(skipna=True); av_m[c]=f"{v2:+.2f}%" if pd.notna(v2) else "-"
-        if dv_avg:
-            av_m["買い残消化日数"]=f"{Md['買い残消化日数_n'].mean(skipna=True):.1f}日"
-            av_m["売り残消化日数"]=f"{Md['売り残消化日数_n'].mean(skipna=True):.1f}日"
-            av_m["信用需給ネット"]=f"{Md['信用需給ネット_n'].mean(skipna=True):+.1f}日"
-        avail_mcols=[c for c in MCOLS if c in dm.columns]
-        disp_m=pd.concat([dm[avail_mcols],pd.DataFrame([{c:av_m.get(c,"") for c in avail_mcols}])],ignore_index=True)
-
-        # 貸借(当日夜に判明)から、まだ未公表の当日の信用残を試算して最上段に出す
-        try:
-            est_m=estimate_margin_from_lending(L_full,M)
-            pred_row,pred_note=build_margin_estimate_view(est_m,dv_avg,avail_mcols)
-        except Exception as e:
-            pred_row,pred_note=None,f"🔮 予測の計算でエラーが発生しました: {e}"
-        if pred_row:
-            disp_m=pd.concat([pd.DataFrame([pred_row]),disp_m],ignore_index=True)
-        st_m=cell_style(disp_m,Md,"日付",MNUM,thr=3.0)
-        if pred_row:
-            st_m.iloc[0,:]="background-color:#12263f;color:#79c0ff;font-weight:700"
-        st.dataframe(disp_m.style.apply(lambda _:st_m,axis=None),
-            use_container_width=True,hide_index=True,height=min(38*(len(disp_m)+1)+38,480))
-        st.caption(
-            "📌 **信用需給ネット** = 買い残高÷日次平均出来高（日）－ 売り残高÷日次平均出来高（日）  \n"
-            "プラス＝買い残が厚い（上昇余地・需給重い両面あり）/ マイナス＝売り残が厚い（下落圧力・買い戻し余地）"
-            + (f"  ※出来高平均={dv_avg/1e6:.1f}M" if dv_avg else ""))
-        if pred_note: st.caption(pred_note)
-    else:
-        st.info("② 週次信用残データなし")
-
-    # ②-3 制度信用倍率（JPX公式PDF・日次）
     MS = info.get("margin_seido", pd.DataFrame())
-    if MS is not None and not MS.empty:
-        st.markdown("**②-3 制度信用倍率（JPX公式・日次）**")
-        st.caption(f"💾 蓄積データ: {len(MS)}日分（{MS['_dt'].min():%Y/%m/%d}～{MS['_dt'].max():%Y/%m/%d}）"
-                   "／株数(Shs.)ベース。②の信用倍率（株探・制度+一般の合計）とは別に、制度信用だけの倍率を表示します"
-                   "（JPXの公開は直近数日分のため、取得した日付は保存して積み上げます）")
-        st.download_button("⬇️ ②-3制度信用データをCSVで保存",
-            MS.drop(columns=["_dt"]).to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"margin_seido_{code}.csv", mime="text/csv", key=f"dl_seido_{code}")
-        MSd = MS.sort_values("_dt", ascending=False).reset_index(drop=True)
-        ds = pd.DataFrame()
-        ds["日付"] = MSd["日付"]
-        ds["制度買い残高"] = MSd["制度買い残高"].apply(fmt)
-        ds["制度買い増減"] = MSd["制度買い増減"].apply(fmt)
-        ds["制度売り残高"] = MSd["制度売り残高"].apply(fmt)
-        ds["制度売り増減"] = MSd["制度売り増減"].apply(fmt)
-        ds["制度信用倍率"] = MSd["制度信用倍率"].apply(lambda v: f"{v:.2f}倍" if pd.notna(v) else "-")
-        ds["合計信用倍率"] = MSd["合計信用倍率"].apply(lambda v: f"{v:.2f}倍" if pd.notna(v) else "-")
-        st.dataframe(ds, use_container_width=True, hide_index=True,
-                     height=min(38 * (len(ds) + 1) + 38, 400))
-    else:
-        st.caption("②-3 制度信用倍率: データなし（JPX一覧ページ未取得・信用取引対象外・未対応銘柄の可能性）")
 
-    # ②-2 機関投資家 空売り情報（nikkeiyosoku.com）
-    SI = info.get("short_inst") or {}
-    S_raw = SI.get("raw", pd.DataFrame())
-    if not S_raw.empty:
-        st.markdown("**②-2 機関投資家 空売り情報**")
-        S_top_inc = SI.get("top_increase", pd.DataFrame())
-        S_top_dec = SI.get("top_decrease", pd.DataFrame())
-        inc_idx = set(S_top_inc.index) if not S_top_inc.empty else set()
-        dec_idx = set(S_top_dec.index) if not S_top_dec.empty else set()
+    with tab_cmp:
+        stock_view.compare_board(L_full, M, MS, period_days)
+        ui.section("📚 詳細データ", "従来の表・チャート（クリックで開く）")
+        with st.expander("① 貸借取引残高 + 逆日歩", expanded=False):
+            if not L.empty:
+                st.markdown("**① 貸借取引残高 + 逆日歩**")
+                st.caption(f"💾 蓄積データ: {len(L_full)}日分（{L_full['_dt'].min():%Y/%m/%d}～{L_full['_dt'].max():%Y/%m/%d}）"
+                           f"／表示中 {len(L)}日分（取得のたびに追記・同じ日付は上書きで二重になりません）")
+                st.download_button("⬇️ ①貸借データをCSVで保存（蓄積全期間）",
+                    L_full.drop(columns=["_dt"]).to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"lending_{code}.csv", mime="text/csv", key=f"dl_lend_{code}")
+                La=L.sort_values("_dt",ascending=True)
+                fig1=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.65,0.35],
+                    vertical_spacing=0.05,
+                    subplot_titles=["融資残高・貸株残高＋株価（右軸）","資金フロー（融資新規－貸株新規）"],
+                    specs=[[{"secondary_y":True}],[{"secondary_y":False}]])
+                # 文字列の日付(申込日)ではなく実際のdatetime(_dt)をx軸に使う。
+                # 融資/貸株残高(日次・約35日分)と株価を同じ文字列カテゴリ軸で重ねると、
+                # 両者の日付集合が完全一致しない場合に軸がずれて破綻するため。
+                fig1.add_trace(go.Scatter(x=La["_dt"],y=La["買い残高"],name="融資残高",
+                    line=dict(color="#388bfd",width=2),fill="tozeroy",fillcolor="rgba(56,139,253,0.08)",
+                    hovertemplate="%{x|%Y/%m/%d}<br>融資残高:%{y:,.0f}<extra></extra>"),
+                    row=1,col=1,secondary_y=False)
+                fig1.add_trace(go.Scatter(x=La["_dt"],y=La["売り残高"],name="貸株残高",
+                    line=dict(color="#f85149",width=2),fill="tozeroy",fillcolor="rgba(248,81,73,0.08)",
+                    hovertemplate="%{x|%Y/%m/%d}<br>貸株残高:%{y:,.0f}<extra></extra>"),
+                    row=1,col=1,secondary_y=False)
+                if not P.empty:
+                    Pa2=P.sort_values("_dt",ascending=True)
+                    fig1.add_trace(go.Scatter(x=Pa2["_dt"],y=Pa2["終値"],name="株価",
+                        line=dict(color="#e3b341",width=1.5,dash="dot"),
+                        hovertemplate="%{x|%Y/%m/%d}<br>¥%{y:,.1f}<extra></extra>"),row=1,col=1,secondary_y=True)
+                    fig1.update_yaxes(title_text="株価",secondary_y=True,gridcolor="#21262d",
+                        tickfont=dict(color="#e3b341",size=9),tickformat=",",row=1,col=1)
+                flow=La["買い新規"].fillna(0)-La.get("売り新規",pd.Series([0]*len(La))).fillna(0)
+                fig1.add_trace(go.Bar(x=La["_dt"],y=flow,name="資金フロー",
+                    marker_color=["#388bfd" if v>=0 else "#f85149" for v in flow],opacity=0.85,
+                    hovertemplate="%{x|%Y/%m/%d}<br>資金フロー:%{y:,.0f}<extra></extra>"),
+                    row=2,col=1)
+                fig1.add_hline(y=0,line_dash="solid",line_color="#484f58",line_width=1,row=2,col=1)
+                fig1.update_xaxes(tickformat="%Y/%m/%d")
+                fig_base(fig1,400); st.plotly_chart(fig1,use_container_width=True)
 
-        Sd = S_raw.sort_values("_dt", ascending=False).reset_index(drop=False)
-        ds = pd.DataFrame()
-        ds["計算日"] = Sd["日付"]
-        ds["空売り機関"] = Sd["空売り機関"]
-        ds["残高比率"] = Sd["残高比率"].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "-")
-        ds["増減率差"] = Sd["増減率差"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
-        ds["残高数量"] = Sd["残高数量"].apply(lambda v: f"{v:,.0f}株" if pd.notna(v) else "-")
-        ds["増減量"]   = Sd["増減量"].apply(lambda v: f"{v:+,.0f}" if pd.notna(v) else "-")
+                LCOLS=["申込日","融資残高","融資残高(対信用比%)","融資増減率（前日比%）","融資新規","融資返済",
+                       "貸株残高","貸株残高(対信用比%)","貸株増減率（前日比%）","貸株新規","貸株返済","貸借倍率","逆日歩"]
+                SRC2DISP={"買い残高":"融資残高","買い新規":"融資新規","買い返済":"融資返済",
+                          "売り残高":"貸株残高","売り新規":"貸株新規","売り返済":"貸株返済"}
+                LNUM_SRC=["買い残高","買い新規","買い返済","売り残高","売り新規","売り返済"]
 
-        # トップN（増加=赤系, 減少=青系）を行単位でカラーリング
-        def _row_style(row):
-            orig_idx = Sd.loc[row.name, "index"]
-            if orig_idx in inc_idx:
-                return ["background-color:#3a1414;color:#ff6b6b"] * len(row)
-            if orig_idx in dec_idx:
-                return ["background-color:#0f2a3a;color:#6bc7ff"] * len(row)
-            return [""] * len(row)
+                # 前日比%は「増減」列（一部ソースでは未提供のため直近日が欠損しがち）に依存せず、
+                # 残高同士の日次変化率（pct_change）から直接算出する。①はtaisyaku.jp/IRバンクいずれも
+                # 日次データのため、週次信用残(②)とは無関係に計算される。
+                La_asc=L_full.sort_values("_dt",ascending=True).reset_index(drop=True)
+                La_asc["融資増減率"]=La_asc["買い残高"].pct_change(fill_method=None)*100
+                La_asc["貸株増減率"]=La_asc["売り残高"].pct_change(fill_method=None)*100
+                Ld=La_asc.sort_values("_dt",ascending=False).reset_index(drop=True)
+                if period_days>0:   # 期間外の行は表示から除く（増減率は期間外の前日も使って計算済み）
+                    Ld=Ld[Ld["_dt"]>=datetime.today()-timedelta(days=period_days)].reset_index(drop=True)
 
-        st.dataframe(ds.style.apply(_row_style, axis=1),
-            use_container_width=True, hide_index=True, height=min(38*(len(ds)+1)+38, 480))
-        st.caption(
-            f"🔴 = 空売り増加トップ{SHORT_TOPN}件（機関の売りトレンド強） / "
-            f"🔵 = 空売り減少（買戻し）トップ{SHORT_TOPN}件（機関の買いトレンド強）  \n"
-            "※nikkeiyosoku.comの「もっと見る」機能はJS描画のためページネーション不可。"
-            "取得できた範囲内でのトップN件を強調表示しています。")
+                dp=pd.DataFrame(); dp["申込日"]=Ld["申込日"]
+                for src,disp in SRC2DISP.items():
+                    dp[disp]=Ld[src].apply(fmt) if src in Ld.columns else "-"
+                dp["融資増減率（前日比%）"]=Ld["融資増減率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
+                dp["貸株増減率（前日比%）"]=Ld["貸株増減率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
+                dp["融資残高(対信用比%)"]=Ld["買い残高"].apply(
+                    lambda v:f"{float(v)/lmb*100:.1f}%" if pd.notna(v) and lmb and lmb>0 else "-")
+                dp["貸株残高(対信用比%)"]=Ld["売り残高"].apply(
+                    lambda v:f"{float(v)/lms*100:.1f}%" if pd.notna(v) and lms and lms>0 else "-")
+                dp["貸借倍率"]=Ld["貸借倍率"].apply(
+                    lambda v:"-" if pd.isna(v) else "∞" if abs(v)==float("inf") else f"{v:.2f}倍")
+                dp["逆日歩"]=Ld["逆日歩"].apply(lambda v:f"{v:.2f}" if pd.notna(v) and v>0 else "-")
+                av={c:"" for c in LCOLS}; av["申込日"]="【平均】"
+                for src,disp in SRC2DISP.items(): av[disp]=fmt(Ld[src].mean(skipna=True))
+                av["融資増減率（前日比%）"]=fmt(Ld["融資増減率"].mean(skipna=True),dec=2,suffix="%")
+                av["貸株増減率（前日比%）"]=fmt(Ld["貸株増減率"].mean(skipna=True),dec=2,suffix="%")
+                av["貸借倍率"]=fmt(Ld["貸借倍率"].replace([float("inf"),float("-inf")],float("nan")).mean(skipna=True),dec=2,suffix="倍")
+                av["逆日歩"]=fmt(Ld["逆日歩"].mean(skipna=True),dec=2)
+                avail_lcols=[c for c in LCOLS if c in dp.columns]
+                disp_l=pd.concat([dp[avail_lcols],pd.DataFrame([{c:av.get(c,"") for c in avail_lcols}])],ignore_index=True)
+                # cell_styleは表示dp側の列名で数値着色を行うため、Ld側にも表示名で数値列を複製しておく
+                Ld_style=Ld.rename(columns=SRC2DISP)
+                Ld_style["融資増減率（前日比%）"]=Ld["融資増減率"]
+                Ld_style["貸株増減率（前日比%）"]=Ld["貸株増減率"]
+                LNUM_DISP=[SRC2DISP[c] for c in LNUM_SRC]
+                st_l=cell_style(disp_l,Ld_style,"申込日",LNUM_DISP+["融資増減率（前日比%）","貸株増減率（前日比%）"],neg_red=["差引残高"])
+                for idx in disp_l[disp_l["申込日"]!="【平均】"].index:
+                    dv=disp_l.loc[idx,"申込日"]
+                    orig=Ld.loc[Ld["申込日"]==dv,"逆日歩"]
+                    if not orig.empty and pd.notna(orig.values[0]) and orig.values[0]>0:
+                        st_l.loc[idx,"逆日歩"]="background-color:#2d1f00;color:#e3b341;font-weight:700"
+                st.dataframe(disp_l.style.apply(lambda _:st_l,axis=None),
+                    use_container_width=True,hide_index=True,height=min(38*(len(disp_l)+1)+38,520))
+            else:
+                st.info("① 貸借データなし")
+        with st.expander("② 週次信用残", expanded=False):
+            if not M.empty:
+                st.markdown("**② 週次信用残**")
+                st.caption(f"💾 蓄積データ: {len(M)}日分（{M['_dt'].min():%Y/%m/%d}～{M['_dt'].max():%Y/%m/%d}）"
+                           "／2026/9/25以降は日次、それ以前は週次データです（取得のたびに追記・同じ日付は上書きで二重になりません）")
+                st.download_button("⬇️ ②信用残データをCSVで保存（蓄積全期間）",
+                    M.drop(columns=["_dt"]).to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"margin_{code}.csv", mime="text/csv", key=f"dl_margin_{code}")
+                dv_avg=P["出来高"].mean() if not P.empty and "出来高" in P.columns else None
+                MCOLS=["日付","買い残高","買い残消化日数","買い増減","売り残高","売り残消化日数",
+                       "売り増減","信用需給ネット","信用倍率","買い残増減率","売り残増減率","逆日歩"]
+                MNUM =["買い残高","買い増減","売り残高","売り増減","信用倍率","買い残増減率","売り残増減率"]
+                Md=M.sort_values("_dt",ascending=False).reset_index(drop=True)
+                if dv_avg:
+                    Md["買い残消化日数_n"]=Md["買い残高"].apply(
+                        lambda v:float(v)/dv_avg if pd.notna(v) and dv_avg else float("nan"))
+                    Md["売り残消化日数_n"]=Md["売り残高"].apply(
+                        lambda v:float(v)/dv_avg if pd.notna(v) and dv_avg else float("nan"))
+                    Md["信用需給ネット_n"]=Md["買い残消化日数_n"]-Md["売り残消化日数_n"]
+                dm=pd.DataFrame(); dm["日付"]=Md["日付"]
+                dm["買い残高"]=Md["買い残高"].apply(fmt)
+                if dv_avg: dm["買い残消化日数"]=Md["買い残消化日数_n"].apply(
+                    lambda v:f"{v:.1f}日" if pd.notna(v) else "-")
+                dm["買い増減"]=Md["買い増減"].apply(fmt)
+                dm["売り残高"]=Md["売り残高"].apply(fmt)
+                if dv_avg: dm["売り残消化日数"]=Md["売り残消化日数_n"].apply(
+                    lambda v:f"{v:.1f}日" if pd.notna(v) else "-")
+                dm["売り増減"]=Md["売り増減"].apply(fmt)
+                if dv_avg: dm["信用需給ネット"]=Md["信用需給ネット_n"].apply(
+                    lambda v:f"{v:+.1f}日" if pd.notna(v) else "-")
+                dm["信用倍率"]=Md["信用倍率"].apply(lambda v:f"{v:.2f}倍" if pd.notna(v) else "-")
+                dm["買い残増減率"]=Md["買い残増減率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
+                dm["売り残増減率"]=Md["売り残増減率"].apply(lambda v:f"{v:+.2f}%" if pd.notna(v) else "-")
+                dm["逆日歩"]=Md["逆日歩"].apply(lambda v:f"{v:.2f}" if pd.notna(v) and v>0 else "-")
+                av_m={c:"" for c in MCOLS}; av_m["日付"]="【平均】"
+                for c in ["買い残高","売り残高"]: av_m[c]=fmt(Md[c].mean(skipna=True))
+                av_m["信用倍率"]=fmt(Md["信用倍率"].mean(skipna=True),dec=2,suffix="倍")
+                for c in ["買い残増減率","売り残増減率"]:
+                    v2=Md[c].mean(skipna=True); av_m[c]=f"{v2:+.2f}%" if pd.notna(v2) else "-"
+                if dv_avg:
+                    av_m["買い残消化日数"]=f"{Md['買い残消化日数_n'].mean(skipna=True):.1f}日"
+                    av_m["売り残消化日数"]=f"{Md['売り残消化日数_n'].mean(skipna=True):.1f}日"
+                    av_m["信用需給ネット"]=f"{Md['信用需給ネット_n'].mean(skipna=True):+.1f}日"
+                avail_mcols=[c for c in MCOLS if c in dm.columns]
+                disp_m=pd.concat([dm[avail_mcols],pd.DataFrame([{c:av_m.get(c,"") for c in avail_mcols}])],ignore_index=True)
 
-        # 空売り者一覧（残高比率が高い順）
-        by_inst = SI.get("by_institution", pd.DataFrame())
-        if not by_inst.empty:
-            st.markdown("**空売り者一覧（残高比率が高い順・下落圧力の目安）**")
-            di = by_inst.copy()
-            di["残高比率"] = di["残高比率"].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "-")
-            st.dataframe(di[["空売り機関","残高比率","計算日"]],
-                use_container_width=True, hide_index=True,
-                height=min(38*(len(di)+1)+38, 360))
-            st.caption("📌 残高比率が高い機関ほど、その銘柄に対して大きな空売りポジションを維持しています。"
-                       "上位に多くの機関・高い比率が並ぶほど、潜在的な下落圧力（買戻しによる反発リスクも含む）が高いと解釈できます。")
+                # 貸借(当日夜に判明)から、まだ未公表の当日の信用残を試算して最上段に出す
+                try:
+                    est_m=estimate_margin_from_lending(L_full,M)
+                    pred_row,pred_note=build_margin_estimate_view(est_m,dv_avg,avail_mcols)
+                except Exception as e:
+                    pred_row,pred_note=None,f"🔮 予測の計算でエラーが発生しました: {e}"
+                if pred_row:
+                    disp_m=pd.concat([pd.DataFrame([pred_row]),disp_m],ignore_index=True)
+                st_m=cell_style(disp_m,Md,"日付",MNUM,thr=3.0)
+                if pred_row:
+                    st_m.iloc[0,:]="background-color:#12263f;color:#79c0ff;font-weight:700"
+                st.dataframe(disp_m.style.apply(lambda _:st_m,axis=None),
+                    use_container_width=True,hide_index=True,height=min(38*(len(disp_m)+1)+38,480))
+                st.caption(
+                    "📌 **信用需給ネット** = 買い残高÷日次平均出来高（日）－ 売り残高÷日次平均出来高（日）  \n"
+                    "プラス＝買い残が厚い（上昇余地・需給重い両面あり）/ マイナス＝売り残が厚い（下落圧力・買い戻し余地）"
+                    + (f"  ※出来高平均={dv_avg/1e6:.1f}M" if dv_avg else ""))
+                if pred_note: st.caption(pred_note)
+            else:
+                st.info("② 週次信用残データなし")
+        with st.expander("②-3 制度信用倍率（JPX公式・日次）", expanded=False):
+            MS = info.get("margin_seido", pd.DataFrame())
+            if MS is not None and not MS.empty:
+                st.markdown("**②-3 制度信用倍率（JPX公式・日次）**")
+                st.caption(f"💾 蓄積データ: {len(MS)}日分（{MS['_dt'].min():%Y/%m/%d}～{MS['_dt'].max():%Y/%m/%d}）"
+                           "／株数(Shs.)ベース。②の信用倍率（株探・制度+一般の合計）とは別に、制度信用だけの倍率を表示します"
+                           "（JPXの公開は直近数日分のため、取得した日付は保存して積み上げます）")
+                st.download_button("⬇️ ②-3制度信用データをCSVで保存",
+                    MS.drop(columns=["_dt"]).to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"margin_seido_{code}.csv", mime="text/csv", key=f"dl_seido_{code}")
+                MSd = MS.sort_values("_dt", ascending=False).reset_index(drop=True)
+                ds = pd.DataFrame()
+                ds["日付"] = MSd["日付"]
+                ds["制度買い残高"] = MSd["制度買い残高"].apply(fmt)
+                ds["制度買い増減"] = MSd["制度買い増減"].apply(fmt)
+                ds["制度売り残高"] = MSd["制度売り残高"].apply(fmt)
+                ds["制度売り増減"] = MSd["制度売り増減"].apply(fmt)
+                ds["制度信用倍率"] = MSd["制度信用倍率"].apply(lambda v: f"{v:.2f}倍" if pd.notna(v) else "-")
+                ds["合計信用倍率"] = MSd["合計信用倍率"].apply(lambda v: f"{v:.2f}倍" if pd.notna(v) else "-")
+                st.dataframe(ds, use_container_width=True, hide_index=True,
+                             height=min(38 * (len(ds) + 1) + 38, 400))
+            else:
+                st.caption("②-3 制度信用倍率: データなし（JPX一覧ページ未取得・信用取引対象外・未対応銘柄の可能性）")
 
-    # ③ テクニカル分析
-    render_technical_section(code,info,col_hex,period_days)
+    with tab_inst:
+        SI = info.get("short_inst") or {}
+        S_raw = SI.get("raw", pd.DataFrame())
+        if not S_raw.empty:
+            st.markdown("**②-2 機関投資家 空売り情報**")
+            S_top_inc = SI.get("top_increase", pd.DataFrame())
+            S_top_dec = SI.get("top_decrease", pd.DataFrame())
+            inc_idx = set(S_top_inc.index) if not S_top_inc.empty else set()
+            dec_idx = set(S_top_dec.index) if not S_top_dec.empty else set()
+
+            Sd = S_raw.sort_values("_dt", ascending=False).reset_index(drop=False)
+            ds = pd.DataFrame()
+            ds["計算日"] = Sd["日付"]
+            ds["空売り機関"] = Sd["空売り機関"]
+            ds["残高比率"] = Sd["残高比率"].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "-")
+            ds["増減率差"] = Sd["増減率差"].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "-")
+            ds["残高数量"] = Sd["残高数量"].apply(lambda v: f"{v:,.0f}株" if pd.notna(v) else "-")
+            ds["増減量"]   = Sd["増減量"].apply(lambda v: f"{v:+,.0f}" if pd.notna(v) else "-")
+
+            # トップN（増加=赤系, 減少=青系）を行単位でカラーリング
+            def _row_style(row):
+                orig_idx = Sd.loc[row.name, "index"]
+                if orig_idx in inc_idx:
+                    return ["background-color:#3a1414;color:#ff6b6b"] * len(row)
+                if orig_idx in dec_idx:
+                    return ["background-color:#0f2a3a;color:#6bc7ff"] * len(row)
+                return [""] * len(row)
+
+            st.dataframe(ds.style.apply(_row_style, axis=1),
+                use_container_width=True, hide_index=True, height=min(38*(len(ds)+1)+38, 480))
+            st.caption(
+                f"🔴 = 空売り増加トップ{SHORT_TOPN}件（機関の売りトレンド強） / "
+                f"🔵 = 空売り減少（買戻し）トップ{SHORT_TOPN}件（機関の買いトレンド強）  \n"
+                "※nikkeiyosoku.comの「もっと見る」機能はJS描画のためページネーション不可。"
+                "取得できた範囲内でのトップN件を強調表示しています。")
+
+            # 空売り者一覧（残高比率が高い順）
+            by_inst = SI.get("by_institution", pd.DataFrame())
+            if not by_inst.empty:
+                st.markdown("**空売り者一覧（残高比率が高い順・下落圧力の目安）**")
+                di = by_inst.copy()
+                di["残高比率"] = di["残高比率"].apply(lambda v: f"{v:.2f}%" if pd.notna(v) else "-")
+                st.dataframe(di[["空売り機関","残高比率","計算日"]],
+                    use_container_width=True, hide_index=True,
+                    height=min(38*(len(di)+1)+38, 360))
+                st.caption("📌 残高比率が高い機関ほど、その銘柄に対して大きな空売りポジションを維持しています。"
+                           "上位に多くの機関・高い比率が並ぶほど、潜在的な下落圧力（買戻しによる反発リスクも含む）が高いと解釈できます。")
+
+    with tab_tech:
+        render_technical_section(code,info,col_hex,period_days)
+
+    with hdr:
+        stock_view.kpi_board(code, info, st.session_state.get(f"tech_latest_{code}"), L_full, M, MS, pr, prc)
 
 # ════════════════════════════════════════
 # メイン
