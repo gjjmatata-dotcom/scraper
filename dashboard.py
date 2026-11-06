@@ -85,6 +85,19 @@ for k,v in [
 ]:
     if k not in st.session_state: st.session_state[k]=v
 
+# ── ページ切替（起動時の既定は「市場全体」）──────────────
+st.sidebar.markdown("### 📑 ページ")
+_page = st.sidebar.radio("ページ", ["🌐 市場全体", "🔍 個別銘柄"], index=0,
+                         key="page_sel", label_visibility="collapsed")
+if _page.startswith("🌐"):
+    try:
+        import market_page
+        market_page.render()
+    except Exception as _e:                      # 市場ページで想定外のエラーが出ても個別銘柄ページは使えるようにする
+        st.error(f"市場全体ページでエラー: {_e}")
+        st.caption("サイドバーから『🔍 個別銘柄』を選ぶと従来の画面を使えます。")
+    st.stop()
+
 # ── サイドバー ────────────────────────────────────────
 try: ip=socket.gethostbyname(socket.gethostname())
 except: ip="取得失敗"
@@ -530,6 +543,95 @@ def render_ai_summary(code: str, info: dict, period_label: str = "全期間"):
 # ════════════════════════════════════════
 # ③ テクニカル分析セクション
 # ════════════════════════════════════════
+def render_seido_chart(code, info, Pa, period_days):
+    """
+    制度信用(JPX公式・日次)の買い残・売り残・倍率を、株価と重ねて表示する。
+    日付ずれ・櫛状の破綻を避けるための配慮:
+      ・x軸は文字列ではなく実際のdatetime。日付は日単位に丸め、同一日の重複は最新を採用
+      ・表示範囲は制度信用データの期間に合わせ、株価もその範囲だけを使う
+        （制度信用は直近数日、株価は数年分あるため、そのまま重ねると片側に潰れる）
+      ・土日と、株価・制度信用のどちらにも存在しない平日(祝日)はrangebreaksで詰める
+      ・目盛りはデータのある日付にだけ置く（同じ日付ラベルが重複しない）
+    """
+    MS = info.get("margin_seido", pd.DataFrame())
+    if MS is None or MS.empty or "_dt" not in MS.columns:
+        return
+    Ms = MS.copy()
+    Ms["_dt"] = pd.to_datetime(Ms["_dt"]).dt.normalize()
+    Ms = Ms.sort_values("_dt").drop_duplicates("_dt", keep="last")
+    if period_days and period_days > 0:
+        Ms = Ms[Ms["_dt"] >= pd.Timestamp(datetime.today() - timedelta(days=period_days)).normalize()]
+    if Ms.empty:
+        st.caption("📊 制度信用チャート: 選択期間内にJPXの制度信用データがありません（期間を広げてください）")
+        return
+
+    x0, x1 = Ms["_dt"].min(), Ms["_dt"].max()
+    pad = pd.Timedelta(days=1)
+
+    # 株価は制度信用の期間内だけ（右軸）
+    Pc = pd.DataFrame()
+    if Pa is not None and not Pa.empty and "_dt" in Pa.columns and "終値" in Pa.columns:
+        Pc = Pa[["_dt", "終値"]].copy()
+        Pc["_dt"] = pd.to_datetime(Pc["_dt"]).dt.normalize()
+        Pc = Pc[(Pc["_dt"] >= x0 - pad) & (Pc["_dt"] <= x1 + pad)]
+        Pc = Pc.sort_values("_dt").drop_duplicates("_dt", keep="last")
+
+    st.markdown("**📊 制度信用（JPX公式・日次）× 株価 連動チャート**")
+    st.caption(f"{x0:%Y/%m/%d}～{x1:%Y/%m/%d}の{len(Ms)}日分。買い残・売り残（左軸・株数）と株価（右軸）、"
+               "下段は制度信用倍率（実線）と合計倍率（点線・株探と同じ基準）。")
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.06,
+        subplot_titles=["制度 買い残高・売り残高 ＋ 株価（右軸）", "制度信用倍率 / 合計信用倍率"],
+        specs=[[{"secondary_y": True}], [{"secondary_y": False}]])
+
+    fig.add_trace(go.Scatter(
+        x=Ms["_dt"], y=Ms["制度買い残高"], name="制度買い残高", mode="lines+markers",
+        line=dict(color="#388bfd", width=2), marker=dict(size=6),
+        hovertemplate="%{x|%Y/%m/%d}<br>制度買い残:%{y:,.0f}株<extra></extra>"),
+        row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=Ms["_dt"], y=Ms["制度売り残高"], name="制度売り残高", mode="lines+markers",
+        line=dict(color="#f85149", width=2), marker=dict(size=6),
+        hovertemplate="%{x|%Y/%m/%d}<br>制度売り残:%{y:,.0f}株<extra></extra>"),
+        row=1, col=1, secondary_y=False)
+    if not Pc.empty:
+        fig.add_trace(go.Scatter(
+            x=Pc["_dt"], y=Pc["終値"], name="株価", mode="lines+markers",
+            line=dict(color="#e3b341", width=1.5, dash="dot"), marker=dict(size=4),
+            hovertemplate="%{x|%Y/%m/%d}<br>¥%{y:,.1f}<extra></extra>"),
+            row=1, col=1, secondary_y=True)
+        fig.update_yaxes(title_text="株価", secondary_y=True, tickformat=",",
+                         tickfont=dict(color="#e3b341", size=9), showgrid=False, row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=Ms["_dt"], y=Ms["制度信用倍率"], name="制度信用倍率", mode="lines+markers",
+        line=dict(color="#3fb950", width=2), marker=dict(size=6),
+        hovertemplate="%{x|%Y/%m/%d}<br>制度信用倍率:%{y:.2f}倍<extra></extra>"),
+        row=2, col=1)
+    if "合計信用倍率" in Ms.columns:
+        fig.add_trace(go.Scatter(
+            x=Ms["_dt"], y=Ms["合計信用倍率"], name="合計信用倍率", mode="lines+markers",
+            line=dict(color="#8b949e", width=1.5, dash="dot"), marker=dict(size=4),
+            hovertemplate="%{x|%Y/%m/%d}<br>合計信用倍率:%{y:.2f}倍<extra></extra>"),
+            row=2, col=1)
+
+    # 休場日を詰める: 土日 + 株価・制度信用のどちらにも無い平日
+    have = set(Ms["_dt"]) | (set(Pc["_dt"]) if not Pc.empty else set())
+    holidays = [d.strftime("%Y-%m-%d") for d in pd.bdate_range(x0, x1) if d not in have]
+    breaks = [dict(bounds=["sat", "mon"])]
+    if holidays and not Pc.empty:           # 株価が無い場合は休場日を判定できないので詰めない
+        breaks.append(dict(values=holidays))
+    fig.update_xaxes(type="date", range=[x0 - pad, x1 + pad], rangebreaks=breaks, tickformat="%m/%d")
+    if len(Ms) <= 20:                        # 目盛りはデータのある日だけ
+        fig.update_xaxes(tickmode="array", tickvals=list(Ms["_dt"]),
+                         ticktext=[d.strftime("%m/%d") for d in Ms["_dt"]])
+    fig.update_yaxes(tickformat=",", row=1, col=1, secondary_y=False)
+    fig.update_yaxes(ticksuffix="倍", row=2, col=1)
+    fig_base(fig, 440)
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def render_technical_section(code, info, col_hex, period_days):
     st.markdown("**③ 株価急変 ＋ テクニカル分析 ＋ 信用残連動 ＋ 比較分析**")
 
@@ -852,6 +954,12 @@ def render_technical_section(code, info, col_hex, period_days):
             fig_m.update_xaxes(tickformat="%Y/%m/%d")
             fig_base(fig_m, 420)
             st.plotly_chart(fig_m, use_container_width=True)
+
+    # ── 制度信用（JPX公式・日次）チャート ─────────────
+    try:
+        render_seido_chart(code, info, Pa, period_days)
+    except Exception as _e:
+        st.caption(f"📊 制度信用チャートの描画でエラー: {_e}")
 
     # ── 株価テーブル ───────────────────────────────
     st.markdown("**📋 株価テーブル**")
@@ -1507,6 +1615,30 @@ def render_stock(code, info, col_hex):
         if pred_note: st.caption(pred_note)
     else:
         st.info("② 週次信用残データなし")
+
+    # ②-3 制度信用倍率（JPX公式PDF・日次）
+    MS = info.get("margin_seido", pd.DataFrame())
+    if MS is not None and not MS.empty:
+        st.markdown("**②-3 制度信用倍率（JPX公式・日次）**")
+        st.caption(f"💾 蓄積データ: {len(MS)}日分（{MS['_dt'].min():%Y/%m/%d}～{MS['_dt'].max():%Y/%m/%d}）"
+                   "／株数(Shs.)ベース。②の信用倍率（株探・制度+一般の合計）とは別に、制度信用だけの倍率を表示します"
+                   "（JPXの公開は直近数日分のため、取得した日付は保存して積み上げます）")
+        st.download_button("⬇️ ②-3制度信用データをCSVで保存",
+            MS.drop(columns=["_dt"]).to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"margin_seido_{code}.csv", mime="text/csv", key=f"dl_seido_{code}")
+        MSd = MS.sort_values("_dt", ascending=False).reset_index(drop=True)
+        ds = pd.DataFrame()
+        ds["日付"] = MSd["日付"]
+        ds["制度買い残高"] = MSd["制度買い残高"].apply(fmt)
+        ds["制度買い増減"] = MSd["制度買い増減"].apply(fmt)
+        ds["制度売り残高"] = MSd["制度売り残高"].apply(fmt)
+        ds["制度売り増減"] = MSd["制度売り増減"].apply(fmt)
+        ds["制度信用倍率"] = MSd["制度信用倍率"].apply(lambda v: f"{v:.2f}倍" if pd.notna(v) else "-")
+        ds["合計信用倍率"] = MSd["合計信用倍率"].apply(lambda v: f"{v:.2f}倍" if pd.notna(v) else "-")
+        st.dataframe(ds, use_container_width=True, hide_index=True,
+                     height=min(38 * (len(ds) + 1) + 38, 400))
+    else:
+        st.caption("②-3 制度信用倍率: データなし（JPX一覧ページ未取得・信用取引対象外・未対応銘柄の可能性）")
 
     # ②-2 機関投資家 空売り情報（nikkeiyosoku.com）
     SI = info.get("short_inst") or {}

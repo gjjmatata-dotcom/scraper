@@ -420,6 +420,8 @@ _STORE_VALUE_COLS = {
     "margin":  ["買い残高","買い増減","売り残高","売り増減","信用倍率","逆日歩"],
     "lending": ["買い残高","買い増減","買い新規","買い返済",
                 "売り残高","売り増減","売り新規","売り返済","貸借倍率","逆日歩"],
+    "seido2":  ["制度買い残高","制度買い増減","制度売り残高","制度売り増減","制度信用倍率",
+                "一般買い残高","一般売り残高","合計買い残高","合計売り残高","合計信用倍率"],
 }
 
 def _store_key(kind: str, code) -> str:
@@ -1360,6 +1362,531 @@ def fetch_margin(code) -> pd.DataFrame:
         print(f"[{code}] 信用残: 蓄積{len(df)}日（{df['_dt'].min():%Y/%m/%d}～{df['_dt'].max():%Y/%m/%d}）")
     return df
 
+# ════════════════════════════════════════
+# ②-3 制度信用倍率（JPX公式「銘柄別信用取引残高」PDF・日次）
+# ════════════════════════════════════════
+# 一覧ページ(01.html)に載っている「YYYYMMDD_mtall.pdf」を全部対象にする。
+# ・銘柄(code)は呼び出し時に都度指定、日付は「その時点で一覧に表示されている全日付」
+# ・取得するのは「株数 Shs.」の行だけ。直下の「金額 Val.」の行の数値は使わない（既存の株数ベースと統一）
+# ・取得済みの日付はストア("seido2:コード")に蓄積し、2回目以降は未取得の日付だけPDFを開く
+# ・一覧ページから消えた日付も、PDFをローカルに保存しておけば後から別銘柄で再解析できる
+#
+# 【実PDFで確認したレイアウト（pdfplumberの抽出結果）】
+#   1銘柄 = 2行。1行目が「株数 Shs.」行(数値12個)、2行目が「金額 Val.」行。
+#   ・株数行: 日本語の銘柄名が折り返してコード・ISINの文字と混ざる。例（1570）:
+#       A ＮＥＸＴ ＦＵＮＤＳ 日経平均レバ投レ信ッ等ジ・…連動型上1場57投00信 受JP益30証47券460005株数 Shs. 127,952 …
+#     → コード(15700)もISINも日本語の文字の間にバラバラに入る。文字列のままでは検索できない。
+#     ただし半角英数字だけを順に拾うと「A」+「15700」+「JP3047460005」が復元できる。
+#     銘柄名が特に長いと「株数 Shs.」の目印まで崩れる（例: 15460「…株場数投 信Sh s.受 益証券 256 64 * …」）。
+#     → 目印には頼らず、「行末の数値列(12個以上)」で株数行を判定する。
+#   ・金額行: 英語の銘柄名の後に「15700 JP3047460005金額 Val.」とコード・ISINがきれいに残ることが多い。
+#   ・コードは5桁（4桁+末尾"0"。7974→79740 / 285A→285A0 / 1570→15700）。
+#   ※「コード行の次の行を株数行とみなす」方式は、次の銘柄(15710)の株数行を拾う事故の原因だった。
+#
+# 【銘柄の特定（間違った銘柄を拾わない）】
+#   ISIN(12桁・銘柄ごとに一意)を主キーにして、株数行と金額行を結びつける。
+#   1. 金額行から「5桁コード＋ISIN＋金額」の連続を抽出（コードは前後が英数字でない独立トークンのみ）
+#   2. 株数行は、コード・ISINより左の部分から半角英数字だけを順に拾い、「ISINの直前5文字=コード」を使う
+#      （コードは必ず「数字3桁+英数字1桁+0」の形式。形式外は無効。ISINの手前に別の数字が付いていても無視）
+#   3. 目的の5桁コード → ISIN → 同じISINの株数行、の順にたどる。
+#      株数行側のコードが読めた場合は、目的のコードと一致することも確認する（不一致なら不採用）
+#   この「+0」変換は _jpx_code5() の中だけで行い、このセクションの外へは出さない。
+#   ストアのキー・DataFrame・fetch_one 等は従来どおり4桁コード(7974 / 285A)のまま。
+#
+# 【数値の読み取り】
+#   株数行の行末の数値列から、半角数字のみ12個（%と*は除外）。並び:
+#   売合計,前比, 買合計,前比, 一般売,前比, 制度売,前比, 一般買,前比, 制度買,前比
+#   整合性は「一般+制度=合計（売・買）」と「残高が負でない」のみで判定する（前比の整合性は見ない）。
+JPX_MARGIN_INDEX_URL = "https://www.jpx.co.jp/markets/statistics-equities/margin/01.html"
+JPX_PDF_ARCHIVE = os.environ.get("JPX_PDF_ARCHIVE", "1") != "0"           # "0"でPDFを保存しない
+JPX_PDF_DIR     = Path(os.environ.get("JPX_PDF_DIR", "jpx_pdf_archive"))   # PDFの保存先
+JPX_PDF_KEEP    = int(os.environ.get("JPX_PDF_KEEP", "60"))                # 保存PDFは新しい順にこの日数分だけ残す
+# 解析結果キャッシュ: PDF(約108ページ・解析に約70秒)を1日分につき1回だけ解析し、全銘柄分の結果を保存する。
+# 以降は銘柄を追加しても、アプリを再起動しても、PDFを開かずにこのキャッシュから引く。
+JPX_PARSED_CACHE = os.environ.get("JPX_PARSED_CACHE", "1") != "0"          # "0"でキャッシュしない
+JPX_PARSED_DIR   = Path(os.environ.get("JPX_PARSED_DIR", "jpx_parsed_cache"))
+_JPX_PARSER_VER  = 3        # 解析ロジックを変えたら上げる（古いキャッシュは自動で破棄して再解析する）
+JPX_DEBUG_DIR   = Path(os.environ.get("JPX_DEBUG_DIR", "jpx_debug"))       # 解析失敗時の行ダンプ先
+_JPX_MIN_ROWS   = 100      # 正しく読めた株数行がこれ未満のPDFは、レイアウト変更/抽出失敗とみなす
+
+SEIDO_COLS = ["_dt","日付","制度買い残高","制度買い増減","制度売り残高","制度売り増減",
+              "制度信用倍率","一般買い残高","一般売り残高","合計買い残高","合計売り残高","合計信用倍率"]
+_JPX_KEYS = ["売合計","売合計前比","買合計","買合計前比",
+             "一般売","一般売前比","制度売","制度売前比",
+             "一般買","一般買前比","制度買","制度買前比"]
+_JPX_ID_RE    = re.compile(r"([0-9]{3}[0-9A-Z]0)([A-Z]{2}[0-9A-Z]{9}[0-9])")   # 5桁コード+ISIN(12桁)
+_JPX_ISIN_OK  = re.compile(r"[A-Z]{2}[0-9A-Z]{9}[0-9]")
+_JPX_CODE5_OK = re.compile(r"[0-9]{3}[0-9A-Z]0")
+_JPX_TAIL_TOK = re.compile(r"▲|△|\*|＊|[0-9][0-9,]*(?:\.[0-9]+)?%?")             # 行末の数値列を構成するトークン
+_JPX_NUM_RE   = re.compile(r"[▲△]?\s*[0-9][0-9,]*", re.ASCII)
+_jpx_index_cache: dict = {}     # {"YYYYMMDD": 索引}（プロセス内キャッシュ）
+_jpx_fail_logged: set = set()   # 失敗ログ・ダンプの重複出力防止
+
+
+def _jpx_code5(code4: str):
+    """
+    JPX PDF用の5桁表記に変換する（JPX専用。他のスクレイピング処理では使わないこと）。
+    4桁数字(7974) または 3桁数字+英字1文字(285A) 以外はNone（＝JPX対象外として扱う）。
+    """
+    c = str(code4).upper().strip()
+    return c + "0" if re.fullmatch(r"\d{4}|\d{3}[A-Z]", c) else None
+
+
+_jpx_list_cache: dict = {"t": 0.0, "v": {}}
+
+
+def _jpx_list_pdfs() -> dict:
+    """一覧ページに表示されている {YYYYMMDD: PDFのURL} を新しい順で返す（10分間は結果を使い回す）。"""
+    from urllib.parse import urljoin
+    if _jpx_list_cache["v"] and time.time() - _jpx_list_cache["t"] < 600:
+        return dict(_jpx_list_cache["v"])
+    html, status = _fetch(JPX_MARGIN_INDEX_URL, referer="https://www.jpx.co.jp/")
+    if not html or status != 200:
+        print(f"[JPX信用] 一覧ページ取得失敗 status={status}")
+        return dict(_jpx_list_cache["v"])          # 失敗時は前回の結果があればそれを返す
+    soup = BeautifulSoup(html, "lxml")
+    out = {}
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"(\d{8})_mtall\.pdf$", a["href"])
+        if m:
+            out[m.group(1)] = urljoin(JPX_MARGIN_INDEX_URL, a["href"])
+    out = dict(sorted(out.items(), reverse=True))
+    if out:
+        _jpx_list_cache.update(t=time.time(), v=out)
+    return out
+
+
+def _jpx_archived_dates() -> list:
+    """ローカルに保存済みの日付一覧（解析キャッシュ・PDF）。一覧ページから消えた日付も使うため。"""
+    out = set()
+    if JPX_PARSED_CACHE and JPX_PARSED_DIR.exists():
+        for p in JPX_PARSED_DIR.glob("*.json.gz"):
+            m = re.fullmatch(r"(\d{8})\.json\.gz", p.name)
+            if m:
+                out.add(m.group(1))
+    if JPX_PDF_ARCHIVE and JPX_PDF_DIR.exists():
+        for p in JPX_PDF_DIR.glob("*_mtall.pdf"):
+            m = re.fullmatch(r"(\d{8})_mtall\.pdf", p.name)
+            if m:
+                out.add(m.group(1))
+    return sorted(out, reverse=True)
+
+
+def _jpx_prune_pdfs():
+    """保存PDFが増えすぎないよう、新しい順に JPX_PDF_KEEP 日分だけ残す。"""
+    try:
+        files = sorted(JPX_PDF_DIR.glob("*_mtall.pdf"), key=lambda p: p.name, reverse=True)
+        for p in files[max(JPX_PDF_KEEP, 1):]:
+            p.unlink()
+    except Exception as e:
+        print(f"[JPX信用] 古いPDFの整理に失敗（処理は続行） {e}")
+
+
+def _jpx_pdf_bytes(date: str, url):
+    """PDFのバイト列を返す。保存済みならそれを使い、無ければ取得する。戻り値: (bytes|None, 取得したか)"""
+    path = JPX_PDF_DIR / f"{date}_mtall.pdf"
+    if JPX_PDF_ARCHIVE and path.exists():
+        try:
+            return path.read_bytes(), False
+        except Exception as e:
+            print(f"[JPX信用] {date}: 保存PDF読込失敗 {e}")
+    if not url:
+        return None, False
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=60)
+            if r.status_code == 200:
+                return r.content, True
+            print(f"[JPX信用] {date}: status={r.status_code}")
+        except Exception as e:
+            print(f"[JPX信用] {date}: 取得例外 {e}")
+        time.sleep(1.5 * (attempt + 1))
+    return None, False
+
+
+def _jpx_to_int(tok: str) -> int:
+    tok = tok.replace(" ", "")
+    neg = tok[:1] in ("▲", "△")
+    n = int(tok.lstrip("▲△").replace(",", ""))
+    return -n if neg else n
+
+
+def _jpx_numbers(seg: str) -> list:
+    """区間から数値を順に取り出す（半角数字のみ。%と*は除外）。"""
+    seg = re.sub(r"[0-9]+(?:\.[0-9]+)?\s*%", " ", seg, flags=re.ASCII)
+    seg = seg.replace("*", " ").replace("＊", " ")
+    return [_jpx_to_int(m.group(0)) for m in _JPX_NUM_RE.finditer(seg)]
+
+
+def _jpx_valid(d: dict) -> bool:
+    """整合性チェック: 一般+制度=合計（売・買）、残高が負でない。前比の整合性は見ない。"""
+    if d["一般売"] + d["制度売"] != d["売合計"]: return False
+    if d["一般買"] + d["制度買"] != d["買合計"]: return False
+    return all(d[k] >= 0 for k in ("売合計", "買合計", "一般売", "制度売", "一般買", "制度買"))
+
+
+def _jpx_pick12(vals: list):
+    """
+    数値列から12個を選んで辞書にする。整合性が取れた最初の組み合わせを採用する。
+    1. 先頭から連続12個 → 2. 先頭付近の連続12個 → 3. 先頭16個から順序を保って12個
+    """
+    n = len(vals)
+    if n < 12:
+        return None
+    for s in range(0, min(n - 12, 4) + 1):
+        d = dict(zip(_JPX_KEYS, vals[s:s + 12]))
+        if _jpx_valid(d):
+            return d
+    head = vals[:16]
+    if len(head) > 12:
+        from itertools import combinations
+        for idx in combinations(range(len(head)), 12):
+            d = dict(zip(_JPX_KEYS, [head[i] for i in idx]))
+            if _jpx_valid(d):
+                return d
+    return None
+
+
+def _jpx_ids(prefix: str):
+    """
+    銘柄名・コード・ISINが混ざった文字列から、半角英数字だけを順に拾って「5桁コード+ISIN」を復元する。
+    例: 'A ＮＥＸＴ…上1場57投00信 受JP益30証47券460005' → ('15700', 'JP3047460005')
+    ISINの直前5文字がコード（数字3桁+英数字1桁+0）。複数見つかれば末尾側（数値に近い方）を採用。
+    """
+    asc = re.sub(r"[^0-9A-Za-z]", "", prefix)
+    ms = list(_JPX_ID_RE.finditer(asc))
+    return (ms[-1].group(1), ms[-1].group(2)) if ms else None
+
+
+def _jpx_split_tail(line: str):
+    """
+    行末の数値列(▲・*・%を含む)とそれより左の部分に分ける。数値が12個に満たなければNone。
+    「株数 Shs.」の目印が崩れている行でも、行末の数値列で判定できる。
+    行末に付く区分文字(K, N など)は読み飛ばす。
+    """
+    toks = line.split()
+    end = len(toks)
+    while end > 0 and re.fullmatch(r"[A-Z]", toks[end - 1]):
+        end -= 1
+    start = end
+    while start > 0 and _JPX_TAIL_TOK.fullmatch(toks[start - 1]):
+        start -= 1
+    tail = " ".join(toks[start:end])
+    if len(_jpx_numbers(tail)) < 12:
+        return None
+    return " ".join(toks[:start]), tail
+
+
+def _jpx_build_index(lines: list) -> dict:
+    """
+    PDFの全行から索引を作る（1日分のPDFにつき1回。その後は銘柄を変えても使い回す）。
+      shs      : {ISIN: {"code5": 株数行から復元したコード, "row": 数値辞書|None, "line": 行番号}}
+      val      : {5桁コード: ISIN}      金額行から復元したもの
+      val_line : {5桁コード: 行番号}
+      shs_code : {5桁コード: ISIN}      株数行から復元したコード
+    行の分類: 「金額」「Val.」を含む行 = 金額行（数値は使わない）。それ以外で行末に数値が12個以上ある行 = 株数行。
+    """
+    shs, val, val_line, shs_code = {}, {}, {}, {}
+    for i, ln in enumerate(lines):
+        cut = [p for p in (ln.find("金額"), ln.find("Val.")) if p >= 0]
+        if cut:                                         # 金額行 → コードとISINだけ取り出す
+            ids = _jpx_ids(ln[:min(cut)])
+            if ids and ids[0] not in val:
+                val[ids[0]] = ids[1]
+                val_line[ids[0]] = i
+            continue
+        sp = _jpx_split_tail(ln)
+        if sp is None:
+            continue
+        prefix, tail = sp
+        ids = _jpx_ids(prefix)
+        if not ids:
+            continue
+        c5, isin = ids
+        if isin in shs:                                 # 同じISINが複数ある場合は最初を採用
+            continue
+        shs[isin] = {"code5": c5, "row": _jpx_pick12(_jpx_numbers(tail)), "line": i}
+        shs_code.setdefault(c5, isin)
+    # 解析に問題のある銘柄だけ、周辺の行を診断用に残す（全行は保持しない）
+    diag = {}
+    for c5, isin in val.items():
+        e = shs.get(isin)
+        if e is None or not e["row"]:
+            v = val_line[c5]
+            diag[c5] = lines[max(v - 3, 0):v + 2]
+    return {"shs": shs, "val": val, "val_line": val_line, "shs_code": shs_code, "diag": diag}
+
+
+def _jpx_cache_path(date: str) -> Path:
+    return JPX_PARSED_DIR / f"{date}.json.gz"
+
+
+def _jpx_cache_save(date: str, idx: dict):
+    """全銘柄分の解析結果を保存する（1日あたり数百KB程度）。"""
+    if not JPX_PARSED_CACHE:
+        return
+    import gzip
+    try:
+        JPX_PARSED_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ver": _JPX_PARSER_VER, "date": date,
+            "shs": {isin: {"c": e["code5"], "r": [e["row"][k] for k in _JPX_KEYS] if e["row"] else None}
+                    for isin, e in idx["shs"].items()},
+            "val": idx["val"], "diag": idx["diag"],
+        }
+        path = _jpx_cache_path(date)
+        tmp = path.with_suffix(".tmp")
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+        tmp.replace(path)
+    except Exception as e:
+        print(f"[JPX信用] {date}: 解析キャッシュの保存に失敗（処理は続行） {e}")
+
+
+def _jpx_cache_load(date: str):
+    """保存済みの解析結果を読み込む。無い・バージョン違い・壊れている場合はNone（→PDFを解析し直す）。"""
+    if not JPX_PARSED_CACHE:
+        return None
+    import gzip
+    path = _jpx_cache_path(date)
+    if not path.exists():
+        return None
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            p = json.load(f)
+        if p.get("ver") != _JPX_PARSER_VER or p.get("date") != date:
+            return None
+        shs, shs_code = {}, {}
+        for isin, e in p["shs"].items():
+            row = dict(zip(_JPX_KEYS, e["r"])) if e["r"] else None
+            shs[isin] = {"code5": e["c"], "row": row, "line": -1}
+            if e["c"]:
+                shs_code.setdefault(e["c"], isin)
+        return {"shs": shs, "val": p["val"], "val_line": {}, "shs_code": shs_code, "diag": p.get("diag", {})}
+    except Exception as e:
+        print(f"[JPX信用] {date}: 解析キャッシュの読込に失敗（PDFから解析し直します） {e}")
+        return None
+
+
+def _jpx_index_for(date: str, url):
+    """
+    指定日の索引（全銘柄分）を返す。メモリ → 解析キャッシュ(ディスク) → PDF解析 の順に探す。
+    PDFを解析するのは、その日付で初めて必要になったときの1回だけ。失敗・異常時はNone。
+    """
+    if date in _jpx_index_cache:
+        return _jpx_index_cache[date]
+    idx = _jpx_cache_load(date)
+    if idx is not None:
+        _jpx_index_cache[date] = idx
+        return idx
+    try:
+        import pdfplumber
+    except ImportError:
+        print("[JPX信用] pdfplumber 未インストール → pip install pdfplumber")
+        return None
+    import io
+    content, downloaded = _jpx_pdf_bytes(date, url)
+    if content is None:
+        return None
+    t0 = time.time()
+    lines = []
+    try:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            for page in pdf.pages:
+                lines.extend((page.extract_text() or "").splitlines())
+                try:
+                    page.flush_cache()          # ページごとにメモリを解放
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[JPX信用] {date}: PDF解析例外 {e}")
+        return None
+
+    idx = _jpx_build_index(lines)
+    del lines
+    n_ok = sum(1 for e in idx["shs"].values() if e["row"])
+    print(f"[JPX信用] {date}: PDF解析 {time.time() - t0:.0f}秒 / 株数行{len(idx['shs'])}件（整合OK {n_ok}件）"
+          f" / 金額行のコード{len(idx['val'])}件")
+    if n_ok < _JPX_MIN_ROWS:
+        # レイアウト変更や抽出失敗の疑い。キャッシュも保存もしない
+        # （「銘柄が無い」と誤判定されて、その日付が二度と取得されなくなる事故を防ぐ）
+        print(f"[JPX信用] {date}: 読めた株数行が{n_ok}件しかありません（PDFのレイアウト変更の可能性）→ 使用しません")
+        return None
+
+    if downloaded and JPX_PDF_ARCHIVE:
+        try:
+            JPX_PDF_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = JPX_PDF_DIR / f"{date}_mtall.pdf.tmp"
+            tmp.write_bytes(content)
+            tmp.replace(JPX_PDF_DIR / f"{date}_mtall.pdf")
+            _jpx_prune_pdfs()
+        except Exception as e:
+            print(f"[JPX信用] {date}: PDF保存失敗（処理は続行） {e}")
+    if downloaded:
+        time.sleep(1.0)            # 連続アクセスの間隔
+    _jpx_cache_save(date, idx)
+    _jpx_index_cache[date] = idx
+    return idx
+
+
+def _jpx_lookup(idx: dict, code4: str):
+    """
+    索引から銘柄を引く。戻り値: (row辞書 or None, 銘柄がPDFに存在したか, 失敗理由)
+    目的の5桁コード → ISIN → 同じISINの株数行 の順にたどる。
+    株数行側のコードが読めている場合は、目的のコードと一致しなければ不採用にする。
+    """
+    code5 = _jpx_code5(code4)
+    if code5 is None:
+        return None, False, ""
+    isins = []
+    if code5 in idx["val"]:
+        isins.append(idx["val"][code5])
+    if code5 in idx["shs_code"] and idx["shs_code"][code5] not in isins:
+        isins.append(idx["shs_code"][code5])
+    if not isins:
+        return None, False, ""
+    reason = "株数行が見つからない"
+    for isin in isins:
+        e = idx["shs"].get(isin)
+        if e is None:
+            continue
+        if e["code5"] is not None and e["code5"] != code5:
+            reason = f"金額行のコード{code5}と株数行のコード{e['code5']}が不一致(ISIN={isin})"
+            continue
+        if e["row"]:
+            return e["row"], True, ""
+        reason = "株数行の数値が整合性チェックに通らない"
+    return None, True, reason
+
+
+def _jpx_dump_failure(date: str, base: str, idx: dict, reason: str):
+    """解析に失敗した銘柄の周辺の生テキストをファイルに残す（原因調査用。同じ日付・銘柄は1回だけ）。"""
+    key = (date, base)
+    if key in _jpx_fail_logged:
+        return
+    _jpx_fail_logged.add(key)
+    code5 = _jpx_code5(base)
+    try:
+        JPX_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        path = JPX_DEBUG_DIR / f"{date}_{base}.txt"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# {date} {base}({code5}) 失敗理由: {reason}\n")
+            for k, ln in enumerate(idx.get("diag", {}).get(code5, [])):
+                f.write(f"{k:3d}: {ln!r}\n")
+        print(f"[JPX信用] {base} {date}: {reason} → 周辺の行を {path} に保存しました")
+    except Exception as ex:
+        print(f"[JPX信用] {base} {date}: {reason}（ダンプ保存にも失敗: {ex}）")
+
+
+_seido_legacy_purged = False
+
+
+def _purge_legacy_seido():
+    """
+    旧版の蓄積キー "seido:*"（株数行の取り違えで誤った値が入っていた可能性がある）を一度だけ削除する。
+    現在のキーは "seido2:*" なので影響しない。失敗しても処理は続行する。
+    """
+    global _seido_legacy_purged
+    if _seido_legacy_purged:
+        return
+    _seido_legacy_purged = True
+    try:
+        if _USE_SUPABASE:
+            r = requests.delete(_sb_url("?code=like.seido:*"), headers=_sb_headers(), timeout=15)
+            if r.status_code not in (200, 204):
+                print(f"[JPX信用] 旧キー(seido:)の削除は行われませんでした status={r.status_code}（動作には影響しません）")
+        else:
+            store = _local_store_load()
+            old = [k for k in store if k.startswith("seido:")]
+            if old:
+                for k in old:
+                    store.pop(k, None)
+                _local_store_save(store)
+                print(f"[JPX信用] 旧キー(seido:)を{len(old)}件削除しました")
+    except Exception as e:
+        print(f"[JPX信用] 旧キー(seido:)の削除に失敗（動作には影響しません） {e}")
+
+
+def _finalize_seido(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=SEIDO_COLS)
+    df = df.sort_values("_dt").reset_index(drop=True)
+    df["日付"] = df["_dt"].dt.strftime("%Y/%m/%d")
+    return df[SEIDO_COLS]
+
+
+def fetch_margin_seido(code) -> pd.DataFrame:
+    """
+    ②-3 制度信用倍率（JPX公式・日次・株数ベース）。
+    codeは都度指定（"7974" "1570" "285A" "7974.T" いずれも可。末尾の"0"は付けない）。
+    日付は一覧ページに表示されている全日付（＋ローカル保存済みPDFの日付）が対象。
+    蓄積済みの日付はPDFを開かないので、2回目以降は新しい日付の分だけ処理する
+    （ログの「今回取得0日 / 蓄積N日」は、すべて取得済みでスキップしたという意味でエラーではない）。
+    1日分の失敗が他の日付・他の銘柄の取得に影響しないよう、日付ごとに例外を握りつぶして続行する。
+    """
+    base = re.sub(r"\.[A-Z]+$", "", str(code)).upper().strip()
+    if _jpx_code5(base) is None:                     # JPX対象外（投資信託・指数・米国株など）
+        return pd.DataFrame(columns=SEIDO_COLS)
+
+    # 蓄積キーは "seido2"。旧版("seido")は株数行の取り違えで誤った値が入っていた可能性があるため引き継がない
+    _purge_legacy_seido()
+    cols = _STORE_VALUE_COLS["seido2"]
+    stored, meta, raw = store_load("seido2", base)
+    notfound = set(meta.get("notfound", []))
+    have = set(stored["_dt"].dt.strftime("%Y%m%d")) if not stored.empty else set()
+
+    try:
+        pdfs = _jpx_list_pdfs()                      # 失敗しても蓄積済みデータは返せる
+    except Exception as e:
+        print(f"[JPX信用] 一覧ページ処理で例外 {e}")
+        pdfs = {}
+    for d in _jpx_archived_dates():
+        pdfs.setdefault(d, None)                     # 一覧から消えた日付も保存PDFから再解析
+    pdfs = dict(sorted(pdfs.items(), reverse=True))
+
+    todo = [d for d in pdfs if d not in have and d not in notfound]   # 新しい順
+    rows = []
+    for d in todo:
+        try:
+            idx = _jpx_index_for(d, pdfs[d])
+            if idx is None:
+                continue
+            row, seen, reason = _jpx_lookup(idx, base)
+            if row:
+                sm, sb = row["制度売"], row["制度買"]
+                tm, tb = row["売合計"], row["買合計"]
+                rows.append({
+                    "_dt": datetime.strptime(d, "%Y%m%d"),
+                    "制度買い残高": sb, "制度買い増減": row["制度買前比"],
+                    "制度売り残高": sm, "制度売り増減": row["制度売前比"],
+                    "制度信用倍率": (sb / sm) if sm else np.nan,
+                    "一般買い残高": row["一般買"], "一般売り残高": row["一般売"],
+                    "合計買い残高": tb, "合計売り残高": tm,
+                    "合計信用倍率": (tb / tm) if tm else np.nan,
+                })
+            elif not seen:
+                notfound.add(d)        # 正常なPDFに銘柄自体が無い（信用取引対象外・未上場日など）
+            else:
+                _jpx_dump_failure(d, base, idx, reason)
+        except Exception as e:
+            print(f"[JPX信用] {base} {d}: 想定外の例外 {type(e).__name__}: {e}（この日付はスキップ）")
+
+    new_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["_dt"] + cols)
+    if notfound != set(meta.get("notfound", [])):
+        meta["notfound"] = sorted(notfound)
+
+    merged = _merge_frames([stored, new_df], cols)
+    try:
+        store_save("seido2", base, merged, raw, meta)
+    except Exception as e:
+        print(f"[JPX信用] {base}: 蓄積ストアへの保存に失敗（今回の結果は表示に使用） {e}")
+
+    df = _finalize_seido(merged)
+    print(f"[JPX信用] {base}: 今回取得{len(rows)}日 / 蓄積{len(df)}日"
+          + (f"（{df['_dt'].min():%Y/%m/%d}～{df['_dt'].max():%Y/%m/%d}）" if not df.empty else ""))
+    return df
+
+
 def estimate_margin_from_lending(L, M, min_pairs: int = 8) -> dict:
     """
     貸借(日証金・当日夜に判明)から、まだ公表されていない当日の信用残(翌日夕方に判明)を試算する。
@@ -2008,5 +2535,11 @@ def fetch_one(code) -> dict:
         short_inst = fetch_institutional_short(code)
     else:
         short_inst = None
+    # 制度信用倍率（JPX公式PDF・日次）。日本株/ETFのみ。失敗しても他の取得に影響させない
+    try:
+        seido = fetch_margin_seido(code) if _code_type(_normalize_jp_code(code)) == "stock_jp" else pd.DataFrame(columns=SEIDO_COLS)
+    except Exception as e:
+        print(f"[{code}] 制度信用(JPX): 例外 {e}")
+        seido = pd.DataFrame(columns=SEIDO_COLS)
     return {"name":name,"lending":l,"price":p,"price_long":p_long,
-            "margin":m,"pressure":judge_pressure(l,p),"short_inst":short_inst}
+            "margin":m,"margin_seido":seido,"pressure":judge_pressure(l,p),"short_inst":short_inst}
