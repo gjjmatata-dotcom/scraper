@@ -14,7 +14,7 @@ from scraper import (fetch_one, fetch_price_by_url, fetch_price_long,
                      calc_technicals, STOCKS, _safe_int_fmt, SHORT_TOPN,
                      estimate_margin_from_lending)
 import socket, re, json, os, requests as _requests
-import ui, stock_view
+import ui, stock_view, rule_view
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -1472,9 +1472,9 @@ def render_stock(code, info, col_hex):
         d_min=p_long["_dt"].min(); d_max=p_long["_dt"].max()
         st.caption(f"📂 長期データ: {len(p_long)}営業日 / {d_min.strftime('%Y/%m/%d')} ～ {d_max.strftime('%Y/%m/%d')}")
 
-    tab_cmp, tab_tech, tab_inst, tab_ai = st.tabs(["⚖️ 需給比較", "📈 株価・テクニカル", "🏦 空売り機関", "🤖 AI要約"])
+    tab_cmp, tab_tech, tab_inst, tab_ai = st.tabs(["⚖️ 需給比較", "📈 株価・テクニカル", "🏦 空売り機関", "🔎 法則探索"])
     with tab_ai:
-        render_ai_summary(code, info, period_label=period_label)
+        rule_view.render(code, info, period_days, period_label)
 
     # 蓄積データは長期になるため、表示は選択期間で絞る（前日比%の計算は全期間のL_fullで行う）
     L_full=L
