@@ -454,6 +454,47 @@ def vix_macd(vix: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def macd_outlook(macd, prov_close=None, horizon: int = 30):
+    """
+    VIXのMACDが「あとどれくらいでクロスするか」を、指数平滑の式から正確に逆算する（予測ではなく算術）。
+      ・次の終値がいくつ以下(以上)ならクロスするか: hist'=0 となる終値 x*（式は線形なので厳密に解ける）
+      ・VIXが今日の終値のまま横ばいなら、何営業日後にクロスするか（horizon日まで）
+      ・暫定値(米国取引中)が確定値になった場合の判定（任意）
+    """
+    if macd is None or len(macd) < 40:
+        return None
+    c = macd["c"].astype(float)
+    e12 = float(c.ewm(span=12, adjust=False).mean().iloc[-1])
+    e26 = float(c.ewm(span=26, adjust=False).mean().iloc[-1])
+    m, s, h = (float(macd[k].iloc[-1]) for k in ("macd", "signal", "hist"))
+    a12, a26, a9 = 2 / 13, 2 / 27, 2 / 10
+
+    def step(x, E12, E26, S):
+        n12 = E12 + a12 * (x - E12)
+        n26 = E26 + a26 * (x - E26)
+        mn = n12 - n26
+        sn = S + a9 * (mn - S)
+        return n12, n26, sn, mn - sn
+
+    x_cross = (s - m + a12 * e12 - a26 * e26) / (a12 - a26)
+    c0 = float(c.iloc[-1])
+    pos = h > 0
+    days, st_ = None, (e12, e26, s)
+    for k in range(1, horizon + 1):
+        n12, n26, sn, hn = step(c0, *st_)
+        st_ = (n12, n26, sn)
+        if (hn > 0) != pos:
+            days = k
+            break
+    out = {"date": macd.index[-1], "c": c0, "macd": m, "signal": s, "hist": h,
+           "hist_prev": float(macd["hist"].iloc[-2]), "x_cross": x_cross, "pct": (x_cross / c0 - 1) * 100,
+           "days_flat": days, "target": "DC" if pos else "GC", "horizon": horizon}
+    if prov_close:
+        _, _, _, hp = step(float(prov_close), e12, e26, s)
+        out.update(prov=float(prov_close), prov_hist=hp, prov_cross=((hp > 0) != pos))
+    return out
+
+
 def shift_to_jp(dates, enable: bool):
     """VIXの日付(米国)を日本の翌営業日(土日は飛ばす)へずらす。"""
     if not enable:

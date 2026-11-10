@@ -234,6 +234,91 @@ def _show_table(t, lv_all, red_all, plb_all, key, fname):
                        file_name=f"{fname}.csv", mime="text/csv", key=f"{key}_dl")
 
 
+def _macd_board(macd, prov):
+    """VIXのMACDを一目で：3つの数字・ヒストの推移・クロスまでの距離。"""
+    pv = prov[1] if (prov and prov[0]) else None
+    o = M.macd_outlook(macd, pv)
+    if not o:
+        return
+    HC_POS, HC_NEG = "#d1495b", "#3b82f6"           # ヒスト＋(赤=GC側) / −(青=DC側)
+    h = o["hist"]
+    up = h > 0
+    trend = abs(h) < abs(o["hist_prev"])
+    chip = ("MACD ＞ シグナル（上向き）" if up else "MACD ＜ シグナル（下向き）")
+    chip2 = ("ヒスト縮小中（デッドクロスに近づく）" if (up and trend) else
+             "ヒスト拡大中（上向きが強まる）" if up else
+             "ヒスト縮小中（ゴールデンクロスに近づく）" if trend else "ヒスト拡大中（下向きが強まる）")
+    # ヒストの棒グラフ（直近25営業日）
+    t = macd.tail(25)
+    vals = t["hist"].values
+    mx = max(abs(vals).max(), 1e-9)
+    W, H, bw = 300, 84, 300 / 25
+    bars = []
+    for i, (v, cr) in enumerate(zip(vals, t["cross"].values)):
+        hh = abs(v) / mx * (H / 2 - 12)
+        y = H / 2 - hh if v >= 0 else H / 2
+        col = HC_POS if v >= 0 else HC_NEG
+        op = 1.0 if i == len(vals) - 1 else 0.55
+        bars.append(f"<rect x='{i * bw + 1:.1f}' y='{y:.1f}' width='{bw - 2:.1f}' height='{max(hh, 1):.1f}' fill='{col}' opacity='{op}'/>")
+        if cr:
+            ty = 10 if v >= 0 else H - 2
+            bars.append(f"<text x='{i * bw + bw / 2:.1f}' y='{ty}' fill='#e6edf3' font-size='9' text-anchor='middle'>{cr}</text>")
+    svg = (f"<svg viewBox='0 0 {W} {H}' width='100%' height='{H}' preserveAspectRatio='none' "
+           f"style='background:#0d1117;border-radius:6px'>"
+           f"<line x1='0' x2='{W}' y1='{H / 2}' y2='{H / 2}' stroke='#484f58' stroke-width='1'/>" + "".join(bars) + "</svg>")
+    # クロスまでの距離
+    tgt = o["target"]
+    tname = "デッドクロス" if tgt == "DC" else "ゴールデンクロス"
+    need = "以下" if tgt == "DC" else "以上"
+    c0, x = o["c"], o["x_cross"]
+    lo, hi = min(c0, x) * 0.97, max(c0, x) * 1.03
+    pos = lambda v: (v - lo) / (hi - lo) * 100
+    gauge = (f"<div style='position:relative;height:14px;background:#0d1117;border-radius:7px;margin:14px 0 4px'>"
+             f"<div style='position:absolute;left:{pos(x):.1f}%;top:-4px;width:3px;height:22px;background:#e3b341'></div>"
+             f"<div style='position:absolute;left:calc({pos(c0):.1f}% - 6px);top:0;width:14px;height:14px;border-radius:7px;background:#f0f6fc'></div></div>"
+             f"<div style='display:flex;justify-content:space-between;font-size:11px;color:#8b949e'>"
+             f"<span>● 今日のVIX {c0:.2f}</span><span style='color:#e3b341'>▌ {tname}の水準 {x:.2f}</span></div>")
+    days = (f"<b>{o['days_flat']}営業日後</b>に{tname}" if o["days_flat"] else f"{o['horizon']}営業日以内には{tname}しません")
+    lines = [f"明日のVIX終値が <b style='color:#e3b341'>{x:.2f}{need}</b>（今日比 {o['pct']:+.1f}%）なら、明日{tname}",
+             f"VIXが今日の終値（{c0:.2f}）のまま<b>横ばい</b>なら、{days}"]
+    if "prov" in o:
+        lines.append(f"暫定値 {o['prov']:.2f} のまま確定すると → " +
+                     (f"<b style='color:#e3b341'>{tname}になります</b>" if o["prov_cross"] else "クロスしません（現状維持）"))
+
+    def box(label, v, color="#f0f6fc"):
+        return (f"<div style='flex:1;min-width:90px'><div style='font-size:11px;color:#8b949e'>{label}</div>"
+                f"<div style='font-size:24px;font-weight:800;color:{color}'>{v:+.2f}</div></div>")
+    html = (
+        "<div style='background:#161b22;border:1px solid #30363d;border-left:5px solid #f0883e;border-radius:8px;padding:10px 14px;margin:8px 0'>"
+        f"<div style='font-size:15px;font-weight:800;color:#f0f6fc;margin-bottom:6px'>🌡 VIX の MACD　<span style='font-size:12px;color:#8b949e;font-weight:500'>{o['date']:%m/%d}確定ベース</span></div>"
+        "<div style='display:flex;flex-wrap:wrap;gap:10px;margin-bottom:6px'>"
+        + box("MACD", o["macd"]) + box("シグナル", o["signal"]) + box("ヒスト（差）", h, HC_POS if up else HC_NEG) + "</div>"
+        f"<div style='font-size:12px;color:#c9d1d9;margin-bottom:6px'>{chip}／{chip2}</div>"
+        f"<div style='font-size:11px;color:#8b949e'>ヒストの推移（直近25営業日・<span style='color:{HC_POS}'>赤=＋</span> <span style='color:{HC_NEG}'>青=−</span>）</div>"
+        + svg + gauge +
+        "<div style='font-size:13px;color:#e6edf3;line-height:1.7;margin-top:6px'>" + "<br>".join("・" + l for l in lines) + "</div>"
+        "<div style='font-size:10px;color:#6e7681;margin-top:4px'>指数平滑の式から逆算した算術値です（予測ではありません）。クロス＝ヒストの符号が変わること。</div>"
+        "</div>")
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def _jpx_notice(data):
+    """JPX日次の掲載状況。最新日と、次の掲載予定（目安16時）を表示する。"""
+    j = data.get("jpx1")
+    if j is None or j.empty:
+        return
+    last = pd.Timestamp(j.index.max()).normalize()
+    nxt = last + pd.offsets.BDay(1)                  # 次に出るはずの取引日（祝日は考慮しない）
+    pub = (nxt + pd.offsets.BDay(1)).normalize() + pd.Timedelta(hours=16)
+    now = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None)
+    if now >= pub:
+        st.caption(f"⏳ JPX日次の取り込み済み最新は **{last:%m/%d}**。{nxt:%m/%d}分は {pub:%m/%d} 16時ごろ（目安）に掲載予定ですが、"
+                   "まだ取り込めていません。JPX側の掲載待ちの可能性が高く、掲載後に「最新に更新」を押すと取り込みます"
+                   "（祝日は考慮していません）。")
+    else:
+        st.caption(f"ℹ️ JPX日次の取り込み済み最新は **{last:%m/%d}**。{nxt:%m/%d}分は {pub:%m/%d} 16時ごろ（目安）に掲載予定です。")
+
+
 def _summary(t1, macd, prov, data, sell_thr, short_thr, pl_thr, plb_thr):
     """今日の数字（大）＋ 平均 ＋ 差。色の条件は表と同じ定義。"""
     BLUE = "background:#1558a8;color:#fff"
@@ -243,12 +328,16 @@ def _summary(t1, macd, prov, data, sell_thr, short_thr, pl_thr, plb_thr):
         r = t1.iloc[0]
         ui.group(f"▼ 最新（①一般+制度）　{t1.index[0].strftime('%Y/%m/%d')}（{r['kind']}）　※平均は蓄積した全期間")
         wk = t1[t1["kind"] == "週次"]
+        d0 = t1.index[0].strftime("%m/%d")
+        sh = t1["short"].dropna()
+        sh_v = sh.iloc[0] if not sh.empty else None
+        sh_d = sh.index[0].strftime("%m/%d") if not sh.empty else "-"
         items = [
-            ui.stat("信用倍率（金額）", r["ratio"], t1["ratio"].mean(), dec=2, accent="#e3b341"),
-            ui.stat("売り残（億円）", r["sell_k"], t1["sell_k"].mean(), dec=0, accent="#f85149",
+            ui.stat(f"信用倍率（金額） {d0}{r['kind']}", r["ratio"], t1["ratio"].mean(), dec=2, accent="#e3b341"),
+            ui.stat(f"売り残（億円） {d0}{r['kind']}", r["sell_k"], t1["sell_k"].mean(), dec=0, accent="#f85149",
                     badge=(f"{sell_thr:,.0f}億円超" if r["sell_k"] > sell_thr else None), badge_style=BLUE),
-            ui.stat("空売り比率合計（%）", r.get("short"), t1["short"].mean(), dec=1, accent="#bc8cff",
-                    badge=(f"{short_thr:g}%以上" if pd.notna(r.get("short")) and r["short"] >= short_thr else None),
+            ui.stat(f"空売り比率合計（%） {sh_d}時点", sh_v, t1["short"].mean(), dec=1, accent="#bc8cff",
+                    badge=(f"{short_thr:g}%以上" if sh_v is not None and sh_v >= short_thr else None),
                     badge_style=DEEP),
         ]
         if not wk.empty and pd.notna(wk.iloc[0]["pl"]):
@@ -276,6 +365,9 @@ def _summary(t1, macd, prov, data, sell_thr, short_thr, pl_thr, plb_thr):
             items.append(ui.stat(f"VIX（{macd.index[-1].strftime('%m/%d')}確定）", last["c"], macd["c"].mean(), dec=2,
                                  accent="#f0883e", note=note, badge=bd, badge_style=bs))
         ui.card_row(items)
+        _jpx_notice(data)
+        if macd is not None and not macd.empty:
+            _macd_board(macd, prov)
 
 
 # ────────────────────────────────────────────
