@@ -76,12 +76,17 @@ def fmt(v, dec=0, suffix=""):
         return (f"{int(round(f)):,}" if dec==0 else f"{f:,.{dec}f}")+suffix
     except: return "-"
 
+# ── 取得済み銘柄データはサーバー側に保持（画面が切れて再接続しても再取得しない）──
+@st.cache_resource
+def _shared_stock_data():
+    return {}
+
 # ── セッション初期化 ──────────────────────────────────
 _persist = load_persist()
 for k,v in [
     ("watch_list",{c:{"name":_persist["watch_names"].get(c,c)}
                    for c in _persist.get("watch_codes",[])}),
-    ("stock_data",{}),
+    ("stock_data",_shared_stock_data()),
     ("search_history",_persist.get("history",{})),
 ]:
     if k not in st.session_state: st.session_state[k]=v
@@ -146,6 +151,12 @@ def _do_fetch(code):
                  {c:wl[c].get("name",c) for c in wl})
     return info,name
 
+def _save_wl():
+    """ウォッチリストの現在の内容を保存（再接続しても同じ銘柄が並ぶように）。"""
+    wl_=st.session_state.watch_list
+    save_persist(st.session_state.search_history,list(wl_.keys()),
+                 {c:wl_[c].get("name",c) for c in wl_})
+
 if (add_btn or only_btn) and inp:
     code=_normalize(inp)
     with st.spinner(f"{code} 取得中…"):
@@ -155,6 +166,7 @@ if (add_btn or only_btn) and inp:
     else:
         if only_btn: st.session_state.watch_list={code:{"name":name}}
         else:        st.session_state.watch_list[code]={"name":name}
+        _save_wl()
         st.success(f"✅ {code} {name}")
 
 hist=st.session_state.search_history
@@ -166,7 +178,7 @@ if hist:
             if st.button(f"＋{hc} {hn}",key=f"h_{hc}"):
                 if hc not in st.session_state.stock_data:
                     with st.spinner(f"{hc}取得中…"): _do_fetch(hc)
-                st.session_state.watch_list[hc]={"name":hn}; st.rerun()
+                st.session_state.watch_list[hc]={"name":hn}; _save_wl(); st.rerun()
 
 st.caption("📋 デフォルト銘柄")
 dcols=st.columns(len(STOCKS)+1)
@@ -175,10 +187,10 @@ for i,(dc,di) in enumerate(STOCKS.items()):
         if st.button(f"＋{dc} {di['name']}",key=f"def_{dc}"):
             if dc not in st.session_state.stock_data:
                 with st.spinner(f"{dc}取得中…"): _do_fetch(dc)
-            st.session_state.watch_list[dc]={"name":di["name"]}; st.rerun()
+            st.session_state.watch_list[dc]={"name":di["name"]}; _save_wl(); st.rerun()
 with dcols[len(STOCKS)]:
     if st.button("🔄 全更新"):
-        st.session_state.stock_data={}; st.rerun()
+        st.session_state.stock_data.clear(); st.rerun()
 
 wl=st.session_state.watch_list
 if wl:
@@ -187,7 +199,7 @@ if wl:
     for i,(wc,wi) in enumerate(list(wl.items())):
         with wcols[i%6]:
             if st.button(f"✕ {wc} {wi.get('name','')}",key=f"rm_{wc}"):
-                wl.pop(wc,None); st.session_state.stock_data.pop(wc,None); st.rerun()
+                wl.pop(wc,None); st.session_state.stock_data.pop(wc,None); _save_wl(); st.rerun()
 
 st.divider()
 if not wl:

@@ -7,6 +7,7 @@ market_page.py ― 「🌐 市場全体」ページ（アプリ起動時のデ�
 """
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -26,7 +27,7 @@ LEVEL_BG = {1: "#12304f", 2: "#1558a8", 3: "#2236d6",   # 薄青 < 濃青 < 最�
 LEVEL_TXT = {1: "#c9d1d9", 2: "#ffffff", 3: "#ffffff", 4: "#ffffff", 5: "#ffffff", 6: "#ffffff"}
 PERIODS = {"1ヶ月": 31, "3ヶ月": 92, "6ヶ月": 183, "1年": 366, "2年": 731, "5年": 1827, "全期間": 0}
 DEFAULT_CMP = "1570"
-REFRESH_SEC = 3600                          # 起動中、この間隔より古ければ自動で取り直す
+# 自動更新はしない（『最新に更新』ボタンを押したときだけ取り直す）
 
 
 _CSS = """<style>
@@ -53,27 +54,58 @@ def _fig_base(fig, h):
 # ────────────────────────────────────────────
 # データの更新と読み出し
 # ────────────────────────────────────────────
-def _refresh(force=False):
-    ss = st.session_state
-    stale = (time.time() - ss.get("mkt_t", 0)) > REFRESH_SEC
-    if force or stale or "mkt_data" not in ss:
-        with st.spinner("市場データを更新中…（新しい分だけ取得して蓄積します）"):
+@st.cache_resource
+def _shared():
+    """アプリを起動している間（サーバー側）ずっと保持する入れ物。
+    iPhoneで画面が切れて再接続されても、ここにあるデータはそのまま使う（再取得しない）。"""
+    return {}
+
+
+def _update_now():
+    """ネットワークから最新を取り直す（『最新に更新』ボタンを押したときだけ呼ぶ）。"""
+    sh = _shared()
+    with st.spinner("市場データを更新中…（新しい分だけ取得して蓄積します）"):
+        try:
+            sh["msgs"] = M.update_all()
+        except Exception as e:                          # 想定外でも画面は落とさない
+            sh["msgs"] = [f"更新処理で例外: {e}"]
+        sh["data"] = M.load_all()
+        sh["prov"] = M.fetch_vix_provisional()
+        sh["t"] = time.time()
+        cmp = sh.setdefault("cmp", {})                  # 比較銘柄の株価も、このボタンのときだけ取り直す
+        for cc in list(cmp.keys()):
             try:
-                ss["mkt_msgs"] = M.update_all()
-            except Exception as e:                      # 想定外でも画面は落とさない
-                ss["mkt_msgs"] = [f"更新処理で例外: {e}"]
-            ss["mkt_data"] = M.load_all()
-            ss["mkt_prov"] = M.fetch_vix_provisional()
-            ss["mkt_t"] = time.time()
-    return ss["mkt_data"]
+                r = _load_price(cc)
+                if r:
+                    cmp[cc] = r
+            except Exception as e:
+                print(f"[比較銘柄更新] {cc}: {e}")
+
+
+def _refresh(force=False):
+    """自動更新はしない。更新するのは (1)ボタン (2)保存データが空の初回だけ。"""
+    ss = st.session_state
+    sh = _shared()
+    if force:
+        _update_now()
+    elif "data" not in sh:
+        data = M.load_all()                             # 保存済みの蓄積データを読むだけ（スクレイピングしない）
+        if data["weekly"].empty and data["jpx1"].empty and data["vix"].empty:
+            _update_now()                               # まだ何も蓄積が無い初回だけ取得する
+        else:
+            sh.update(data=data, prov=(None, None), t=None,
+                      msgs=["保存済みのデータを表示中です（最新化したいときは『🔄 最新に更新』を押してください）"])
+    ss["mkt_data"], ss["mkt_prov"] = sh["data"], sh["prov"]
+    ss["mkt_t"], ss["mkt_msgs"] = sh["t"], sh["msgs"]
+    return sh["data"]
 
 
 def _compare_state():
-    ss = st.session_state
-    if "mkt_cmp" not in ss:
-        ss["mkt_cmp"] = {}
-        ss["mkt_cmp_init"] = False
-    return ss["mkt_cmp"]
+    sh = _shared()
+    if "cmp" not in sh:
+        sh["cmp"] = {}
+        sh["cmp_init"] = False
+    return sh["cmp"]
 
 
 def _load_price(code):
@@ -166,6 +198,9 @@ def render():
             _refresh(force=True)
     data = _refresh()
     ss = st.session_state
+    _t = ss.get("mkt_t")
+    st.caption("🕒 最終更新: " + (datetime.fromtimestamp(_t, ZoneInfo("Asia/Tokyo")).strftime("%m/%d %H:%M") if _t else "このアプリ起動後は未更新（保存済みデータを表示中）")
+               + "　※自動更新はしません。最新にしたいときだけ「🔄 最新に更新」を押してください。")
 
     with c1:
         period_label = st.radio("表示期間", list(PERIODS), index=3, horizontal=True, key="mkt_period")
@@ -329,14 +364,16 @@ def _summary(t1, macd, prov, data, sell_thr, short_thr, pl_thr, plb_thr):
         ui.group(f"▼ 最新（①一般+制度）　{t1.index[0].strftime('%Y/%m/%d')}（{r['kind']}）　※平均は蓄積した全期間")
         wk = t1[t1["kind"] == "週次"]
         d0 = t1.index[0].strftime("%m/%d")
-        sh = t1["short"].dropna()
+        # 空売り比率は当日分が出るため、表(信用残のある日だけ)ではなく取得した系列そのものから最新を取る
+        shs = data.get("short")
+        sh = shs["short"].dropna().sort_index(ascending=False) if shs is not None and not shs.empty else t1["short"].dropna()
         sh_v = sh.iloc[0] if not sh.empty else None
         sh_d = sh.index[0].strftime("%m/%d") if not sh.empty else "-"
         items = [
             ui.stat(f"信用倍率（金額） {d0}{r['kind']}", r["ratio"], t1["ratio"].mean(), dec=2, accent="#e3b341"),
             ui.stat(f"売り残（億円） {d0}{r['kind']}", r["sell_k"], t1["sell_k"].mean(), dec=0, accent="#f85149",
                     badge=(f"{sell_thr:,.0f}億円超" if r["sell_k"] > sell_thr else None), badge_style=BLUE),
-            ui.stat(f"空売り比率合計（%） {sh_d}時点", sh_v, t1["short"].mean(), dec=1, accent="#bc8cff",
+            ui.stat(f"空売り比率合計（%） {sh_d}時点", sh_v, sh.mean() if not sh.empty else None, dec=1, accent="#bc8cff",
                     badge=(f"{short_thr:g}%以上" if sh_v is not None and sh_v >= short_thr else None),
                     badge_style=DEEP),
         ]
@@ -365,6 +402,9 @@ def _summary(t1, macd, prov, data, sell_thr, short_thr, pl_thr, plb_thr):
             items.append(ui.stat(f"VIX（{macd.index[-1].strftime('%m/%d')}確定）", last["c"], macd["c"].mean(), dec=2,
                                  accent="#f0883e", note=note, badge=bd, badge_style=bs))
         ui.card_row(items)
+        if not sh.empty and sh.index[0] > t1.index[0]:
+            st.caption(f"ℹ️ 空売り比率は当日分（{sh.index[0]:%m/%d}）まで取得済みです。信用残・評価損益は"
+                       f"{t1.index[0]:%m/%d}分までの掲載です（空売り比率の最新日は、表には信用残のある日だけが並ぶため出ません。チャートには出ます）。")
         _jpx_notice(data)
         if macd is not None and not macd.empty:
             _macd_board(macd, prov)
@@ -379,8 +419,8 @@ def _chart(data, t1, t2, macd, cutoff, shift, prov, sell_thr, short_thr):
         return
     cmp_data = _compare_state()
     ss = st.session_state
-    if not ss.get("mkt_cmp_init"):                      # 既定で 1570（日経平均レバレッジ）を比較に入れる
-        ss["mkt_cmp_init"] = True
+    if not _shared().get("cmp_init"):                   # 既定で 1570（日経平均レバレッジ）を比較に入れる（起動後の最初の1回だけ）
+        _shared()["cmp_init"] = True
         with st.spinner(f"比較銘柄 {DEFAULT_CMP} を取得中…"):
             try:
                 r = _load_price(DEFAULT_CMP)
