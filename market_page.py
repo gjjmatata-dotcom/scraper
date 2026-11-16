@@ -226,7 +226,7 @@ def render():
     plb_all = (t1["pl"] >= -plb_thr) if (t1 is not None and not t1.empty) else pd.Series(dtype=bool)
 
     # ── 概況（今日の数字 ＋ 平均）───────────────
-    _summary(t1, macd, ss.get("mkt_prov"), data, sell_thr, short_thr, pl_thr, plb_thr)
+    _summary(t1, macd, ss.get("mkt_prov"), data, sell_thr, short_thr, pl_thr, plb_thr, t2=t2)
 
     tab_t, tab_c = st.tabs(["📋 需給テーブル", "📈 VIX × 株価 × 信用需給チャート"])
 
@@ -354,7 +354,7 @@ def _jpx_notice(data):
         st.caption(f"ℹ️ JPX日次の取り込み済み最新は **{last:%m/%d}**。{nxt:%m/%d}分は {pub:%m/%d} 16時ごろ（目安）に掲載予定です。")
 
 
-def _summary(t1, macd, prov, data, sell_thr, short_thr, pl_thr, plb_thr):
+def _summary(t1, macd, prov, data, sell_thr, short_thr, pl_thr, plb_thr, t2=None):
     """今日の数字（大）＋ 平均 ＋ 差。色の条件は表と同じ定義。"""
     BLUE = "background:#1558a8;color:#fff"
     RED = "background:#a11f2e;color:#fff"
@@ -402,6 +402,15 @@ def _summary(t1, macd, prov, data, sell_thr, short_thr, pl_thr, plb_thr):
             items.append(ui.stat(f"VIX（{macd.index[-1].strftime('%m/%d')}確定）", last["c"], macd["c"].mean(), dec=2,
                                  accent="#f0883e", note=note, badge=bd, badge_style=bs))
         ui.card_row(items)
+        if t2 is not None and not t2.empty and t2["ratio"].notna().any():
+            r2 = t2.dropna(subset=["ratio"]).iloc[0]
+            d2 = t2.dropna(subset=["ratio"]).index[0]
+            ui.group(f"▼ 最新（②制度信用のみ）　{d2.strftime('%Y/%m/%d')}（{r2['kind']}）　※平均は蓄積した全期間")
+            ui.card_row([
+                ui.stat(f"制度 信用倍率（金額） {d2.strftime('%m/%d')}{r2['kind']}", r2["ratio"], t2["ratio"].mean(), dec=2, accent="#e3b341"),
+                ui.stat(f"制度 売り残（億円） {d2.strftime('%m/%d')}{r2['kind']}", r2["sell_k"], t2["sell_k"].mean(), dec=0, accent="#f85149"),
+                ui.stat(f"制度 買い残（億円） {d2.strftime('%m/%d')}{r2['kind']}", r2["buy_k"], t2["buy_k"].mean(), dec=0, accent="#3fb950"),
+            ])
         if not sh.empty and sh.index[0] > t1.index[0]:
             st.caption(f"ℹ️ 空売り比率は当日分（{sh.index[0]:%m/%d}）まで取得済みです。信用残・評価損益は"
                        f"{t1.index[0]:%m/%d}分までの掲載です（空売り比率の最新日は、表には信用残のある日だけが並ぶため出ません。チャートには出ます）。")

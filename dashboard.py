@@ -14,9 +14,11 @@ from scraper import (fetch_one, fetch_price_by_url, fetch_price_long,
                      calc_technicals, STOCKS, _safe_int_fmt, SHORT_TOPN,
                      estimate_margin_from_lending)
 import socket, re, json, os, requests as _requests
-import ui, stock_view, rule_view
+import ui, stock_view, rule_view, stock_head
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 # ── 永続化 ────────────────────────────────────────────
 PERSIST_FILE = Path("persist_state.json")
@@ -142,6 +144,7 @@ def _normalize(code):
 
 def _do_fetch(code):
     info=fetch_one(code); name=info["name"] or code
+    info["_fetched_at"]=time.time()
     st.session_state.stock_data[code]=info
     h=st.session_state.search_history
     h.pop(code,None)
@@ -1134,6 +1137,26 @@ def render_technical_section(code, info, col_hex, period_days):
             "avg": {"close": _finite(Pa_asc, "終値"), "chg_abs": _finite(Pa_asc["前日比%"].abs()) if "前日比%" in Pa_asc.columns else None,
                     "dev25": _finite(Pa_asc, "25日乖離率"), "rsi": _finite(Pa_asc, "RSI")},
         }
+        # 新ヘッド（stock_head.py）用の追加情報。いずれも上の表と同じ列から取り出すだけ（新しい定義は作らない）
+        _ex = {}
+        try:
+            _ex["closes_all"] = [float(v) for v in p_all["終値"].astype(float).tolist()]       # MACD逆算用（表と同じ全期間）
+            _ex["dates"] = [str(v) for v in Pa_asc["日付"].tolist()[-6:]]
+            _ex["chg5"] = [float(v) for v in Pa_asc["前日比%"].astype(float).tolist()[-5:]] if "前日比%" in Pa_asc.columns else []
+            _ex["rsi4"] = [float(v) for v in Pa_asc["RSI"].astype(float).tolist()[-4:]] if "RSI" in Pa_asc.columns else []
+            _ex["hist15"] = [float(v) for v in Pa_asc["MACD_hist"].astype(float).tolist()[-15:]] if "MACD_hist" in Pa_asc.columns else []
+            for _k, _c in (("bb_u", "BB_upper"), ("bb_l", "BB_lower"), ("ma25", "MA25"), ("sar", "SAR")):
+                _ex[_k] = float(Pa_asc[_c].iloc[-1]) if (_c in Pa_asc.columns and pd.notna(Pa_asc[_c].iloc[-1])) else None
+            _ex["close_dates"] = [str(v)[:10] for v in pd.to_datetime(p_all["_dt"]).tolist()]
+            # 表示期間ぶんの系列（期間を変えると統計も一緒に変わる）
+            _ex["p_dates"] = [str(v)[:10] for v in pd.to_datetime(Pa_asc["_dt"]).tolist()]
+            _ex["p_close"] = [float(v) for v in Pa_asc["終値"].astype(float).tolist()]
+            for _k, _c in (("p_ma25", "MA25"), ("p_dev25", "25日乖離率"), ("p_rsi", "RSI"), ("p_chg", "前日比%")):
+                _ex[_k] = ([None if pd.isna(v) else float(v) for v in Pa_asc[_c].astype(float).tolist()] if _c in Pa_asc.columns else [])
+            _ex["p_sar_bull"] = ([bool(v) for v in Pa_asc["SAR_bull"].tolist()] if "SAR_bull" in Pa_asc.columns else [])
+        except Exception as _e2:
+            print(f"[新ヘッド用データ] {_e2}")
+        st.session_state[f"tech_latest_{code}"].update(_ex)
     except Exception as _e:
         st.session_state.pop(f"tech_latest_{code}", None)
 
@@ -1479,6 +1502,26 @@ def render_stock(code, info, col_hex):
     st.session_state[period_key]=period_label
     period_days=PERIOD_OPTIONS[period_label]
 
+    # ── データの取得時刻と各データの最新日（自動更新はしないので、鮮度をここで確認する）──
+    def _last(df):
+        try:
+            return f"{pd.to_datetime(df['_dt']).max():%m/%d}" if df is not None and len(df) else "-"
+        except Exception:
+            return "-"
+    _ft = info.get("_fetched_at")
+    _fts = datetime.fromtimestamp(_ft, ZoneInfo("Asia/Tokyo")).strftime("%m/%d %H:%M") if _ft else "不明（保存前に取得）"
+    cA, cB = st.columns([4, 1])
+    with cA:
+        st.caption(f"🕒 取得 {_fts}　｜　株価 最新 {_last(info.get('price_long') if len(info.get('price_long', [])) else info.get('price'))}"
+                   f"　／貸借 最新 {_last(L)}　／信用(株探) 最新 {_last(M)}"
+                   f"　／制度信用(JPX) 最新 {_last(info.get('margin_seido'))}"
+                   "　※自動更新はしません。新しくしたいときは右のボタンを押してください。")
+    with cB:
+        if st.button("🔄 この銘柄を更新", key=f"refresh_{code}", use_container_width=True):
+            with st.spinner(f"{code} 取得中…"):
+                _do_fetch(code)
+            st.rerun()
+
     p_long=info.get("price_long",pd.DataFrame())
     if not p_long.empty:
         d_min=p_long["_dt"].min(); d_max=p_long["_dt"].max()
@@ -1730,7 +1773,22 @@ def render_stock(code, info, col_hex):
         render_technical_section(code,info,col_hex,period_days)
 
     with hdr:
-        stock_view.kpi_board(code, info, st.session_state.get(f"tech_latest_{code}"), L_full, M, MS, pr, prc)
+        _tl = st.session_state.get(f"tech_latest_{code}")
+        try:
+            _ss = st.session_state
+            _mk = None
+            try:
+                import market_page as _mp
+                _mk = _mp._shared().get("data")      # 市場ページで読み込み済みのデータ（再取得しない）
+            except Exception:
+                _mk = None
+            stock_head.render(code, info, _tl, L_full, M, MS, pr, prc, market_data=_mk, period_days=period_days, period_label=period_label,
+                              sell_thr=float(_ss.get("mkt_sell_thr", 8000.0)), short_thr=float(_ss.get("mkt_short_thr", 40.0)),
+                              pl_thr=-abs(float(_ss.get("mkt_pl_thr", 10.0))), plb_thr=-abs(float(_ss.get("mkt_plb_thr", 3.0))))
+        except Exception as _eh:      # 新ヘッドで何かあっても、従来のボードで必ず表示する
+            print(f"[新ヘッド] 例外のため従来表示に切替: {_eh}")
+            st.caption(f"⚠ 新しいヘッドの表示でエラーが出たため、従来の表示にしています（{_eh}）")
+            stock_view.kpi_board(code, info, _tl, L_full, M, MS, pr, prc)
 
 # ════════════════════════════════════════
 # メイン
