@@ -100,11 +100,11 @@ def kpi_board(code, info, tech, L_full, M, MS, pr, prc):
     md, md_dt = _last(M, "信用倍率")
     gyaku, _ = _last(L_full, "逆日歩")
     cards = [
-        ui.stat("制度信用倍率（JPX・株数）", sd, _finite_mean(MS["制度信用倍率"]) if MS is not None and not MS.empty else None,
+        ui.stat("制度信用取引倍率（JPX・株数）", sd, _finite_mean(MS["制度信用倍率"]) if MS is not None and not MS.empty else None,
                 dec=2, suffix="倍", accent="#388bfd", note=(f"{sd_dt:%m/%d}" if sd_dt is not None else "データなし")),
-        ui.stat("貸借倍率（日証金）", ld, _finite_mean(L_full["貸借倍率"]) if L_full is not None and not L_full.empty else None,
+        ui.stat("貸借取引倍率（日証金）", ld, _finite_mean(L_full["貸借倍率"]) if L_full is not None and not L_full.empty else None,
                 dec=2, suffix="倍", accent="#e3b341", note=(f"{ld_dt:%m/%d}" if ld_dt is not None else "データなし")),
-        ui.stat("信用倍率（株探・一般+制度）", md, _finite_mean(M["信用倍率"]) if M is not None and not M.empty else None,
+        ui.stat("信用倍率（一般＋制度の合計・株探）", md, _finite_mean(M["信用倍率"]) if M is not None and not M.empty else None,
                 dec=2, suffix="倍", accent="#3fb950", note=(f"{md_dt:%m/%d}" if md_dt is not None else "データなし")),
     ]
     if M is not None and not M.empty:
@@ -145,9 +145,9 @@ def compare_board(L_full, M, MS, period_days):
                 "平均との差": (f(r - avg, 2, "", True) if (r is not None and avg is not None) else "-")}
 
     tbl = pd.DataFrame({
-        "貸借（日証金）": rowset(L_full, "買い残高", "売り残高", "貸借倍率"),
-        "信用合計（株探）": rowset(M, "買い残高", "売り残高", "信用倍率", "買い残増減率", "売り残増減率"),
-        "制度信用（JPX・株数）": rowset(MS, "制度買い残高", "制度売り残高", "制度信用倍率"),
+        "貸借取引（日証金）": rowset(L_full, "買い残高", "売り残高", "貸借倍率"),
+        "一般＋制度の合計（株探）": rowset(M, "買い残高", "売り残高", "信用倍率", "買い残増減率", "売り残増減率"),
+        "制度信用取引（JPX・株数）": rowset(MS, "制度買い残高", "制度売り残高", "制度信用倍率"),
     })
     tbl.index.name = "指標"
 
