@@ -269,6 +269,37 @@ def _show_table(t, lv_all, red_all, plb_all, key, fname):
                        file_name=f"{fname}.csv", mime="text/csv", key=f"{key}_dl")
 
 
+def _vix_zone_board(macd):
+    """VIXの危険水域を色で：5段階の帯に今の位置と、隣の水準までの距離。"""
+    if macd is None or macd.empty:
+        return
+    c0 = float(macd["c"].iloc[-1])
+    z = M.vix_zone(c0)
+    if not z:
+        return
+    nm, col, lo, hi, txt = z
+    segs = "".join(
+        f"<div style='flex:1;text-align:center;padding:7px 2px;border-radius:6px;background:{c}{'55' if n == nm else '22'};"
+        f"border:{'2px solid ' + c if n == nm else '1px solid ' + c + '55'}'>"
+        f"<div style='font-size:13px;font-weight:900;color:{c}'>{n}</div>"
+        f"<div style='font-size:10px;color:#a8b3c0'>{(str(h) + '未満') if l == 0 else (str(l) + '以上') if h > 1e6 else (str(l) + '〜' + str(h) + '未満')}</div></div>"
+        for l, h, n, c, _ in M.VIX_ZONES)
+    mk = "".join(f"<div style='flex:1;text-align:center;font-size:12px;font-weight:900;color:#f0f6fc;height:16px'>{'▼ 現在' if n == nm else ''}</div>"
+                 for _, _, n, _, _ in M.VIX_ZONES)
+    down = f"{lo}未満の「{[x for x in M.VIX_ZONES if x[1] == lo][0][2]}」まで あと <b>{lo - c0:+.2f}</b>" if lo > 0 else ""
+    up = f"{hi}以上の「{[x for x in M.VIX_ZONES if x[0] == hi][0][2]}」まで あと <b>{hi - c0:+.2f}</b>" if hi < 1e6 else ""
+    st.markdown(
+        f"<div style='background:#161b22;border:1px solid #30363d;border-left:5px solid {col};border-radius:8px;padding:10px 14px;margin:8px 0'>"
+        f"<div style='font-size:15px;font-weight:800;color:#f0f6fc'>🚦 VIX の危険水域　<span style='font-size:12px;color:#8b949e;font-weight:500'>{macd.index[-1]:%m/%d}確定</span></div>"
+        f"<div style='display:flex;align-items:baseline;gap:10px;margin:4px 0'><span style='font-size:34px;font-weight:900;color:{col}'>{c0:.2f}</span>"
+        f"<span style='font-size:15px;font-weight:900;color:{col};border:2px solid {col};border-radius:6px;padding:1px 10px'>{nm}</span></div>"
+        f"<div style='display:flex;gap:4px'>{mk}</div><div style='display:flex;gap:4px'>{segs}</div>"
+        f"<div style='font-size:13px;color:#c9d1d9;margin-top:8px;line-height:1.7'>{txt}<br>"
+        + (f"・下がると {down}<br>" if down else "") + (f"・上がると {up}" if up else "") +
+        "</div><div style='font-size:10px;color:#6e7681;margin-top:4px'>区分はnikkei225jp.comの水準の目安に合わせています。</div></div>",
+        unsafe_allow_html=True)
+
+
 def _macd_board(macd, prov):
     """VIXのMACDを一目で：3つの数字・ヒストの推移・クロスまでの距離。"""
     pv = prov[1] if (prov and prov[0]) else None
@@ -399,8 +430,11 @@ def _summary(t1, macd, prov, data, sell_thr, short_thr, pl_thr, plb_thr, t2=None
                 bs = DEEP if e == "DC" else RED
             if prov and prov[0]:
                 note += f"<br>暫定 {prov[1]:.2f}（{prov[0][5:].replace('-', '/')}米国取引中）"
+            zz = M.vix_zone(last["c"])
+            if zz:
+                note += f"<br>水準：<b style='color:{zz[1]}'>{zz[0]}</b>（{zz[2]}〜{'' if zz[3] > 1e6 else zz[3]}）"
             items.append(ui.stat(f"VIX（{macd.index[-1].strftime('%m/%d')}確定）", last["c"], macd["c"].mean(), dec=2,
-                                 accent="#f0883e", note=note, badge=bd, badge_style=bs))
+                                 accent=(zz[1] if zz else "#f0883e"), note=note, badge=bd, badge_style=bs))
         ui.card_row(items)
         if t2 is not None and not t2.empty and t2["ratio"].notna().any():
             r2 = t2.dropna(subset=["ratio"]).iloc[0]
@@ -416,6 +450,7 @@ def _summary(t1, macd, prov, data, sell_thr, short_thr, pl_thr, plb_thr, t2=None
                        f"{t1.index[0]:%m/%d}分までの掲載です（空売り比率の最新日は、表には信用残のある日だけが並ぶため出ません。チャートには出ます）。")
         _jpx_notice(data)
         if macd is not None and not macd.empty:
+            _vix_zone_board(macd)
             _macd_board(macd, prov)
 
 
@@ -490,6 +525,11 @@ def _chart(data, t1, t2, macd, cutoff, shift, prov, sell_thr, short_thr):
                                [{"secondary_y": False}], [{"secondary_y": False}]])
     base_v = mc["c"].iloc[0]
     vy = (mc["c"] / base_v * 100) if relative else mc["c"]
+    if not relative:                                    # VIXの危険水域を背景の色帯で表示
+        top_ = float(mc["c"].max()) * 1.08
+        for lo_, hi_, nm_, c_, _ in M.VIX_ZONES:
+            if lo_ < top_:
+                fig.add_hrect(y0=lo_, y1=min(hi_, top_), fillcolor=c_, opacity=0.08, line_width=0, row=1, col=1)
     fig.add_trace(go.Scatter(x=mc.index, y=vy, mode="lines", name="VIX",
                              line=dict(color="#f0883e", width=2),
                              hovertemplate="%{x|%Y/%m/%d}<br>VIX %{y:.2f}<extra></extra>"), row=1, col=1)

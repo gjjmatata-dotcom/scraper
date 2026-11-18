@@ -454,6 +454,31 @@ def vix_macd(vix: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
+# ── VIXの水準（nikkei225jp.com の区分に合わせた5段階）──
+VIX_ZONES = [
+    (0, 15, "低め", "#3fb950", "落ち着いた状態の目安。ただし急変への備えは必要です"),
+    (15, 20, "平常目安", "#58a6ff", "比較的落ち着いた水準。直近の上昇・低下も合わせて確認します"),
+    (20, 30, "注意", "#e3b341", "値動きへの警戒が強まりやすい水準。短期間の急上昇にも注意"),
+    (30, 40, "警戒", "#f0883e", "大きな変動を織り込む状態。価格の上下動が荒くなりやすい目安"),
+    (40, 1e9, "強い警戒", "#f85149", "市場が強い不安に傾いている水準"),
+]
+
+
+def vix_zone(v):
+    """VIXの値 → (名前, 色, 下限, 上限, 読み方)。値が無ければ None。"""
+    try:
+        x = float(v)
+    except Exception:
+        return None
+    if x != x:
+        return None
+    for lo, hi, nm, col, txt in VIX_ZONES:
+        if lo <= x < hi:
+            return nm, col, lo, hi, txt
+    return None
+
+
 def macd_outlook(macd, prov_close=None, horizon: int = 30):
     """
     VIXのMACDが「あとどれくらいでクロスするか」を、指数平滑の式から正確に逆算する（予測ではなく算術）。

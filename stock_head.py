@@ -916,6 +916,9 @@ def render(code, info, tech, L_full, M, MS, pr, prc, market_data=None, sell_thr=
                 sel = macd[macd["cross"] != ""]
                 lastx = f"{sel.index[-1]:%m/%d}に{'GC' if sel['cross'].iloc[-1]=='GC' else 'DC'}" if len(sel) else "クロスなし"
                 chip = f"{lastx} → " + ("下落基調（MACD＞シグナル）" if h > 0 else "上昇基調（MACD＜シグナル）")
+                _z = _M.vix_zone(float(macd["c"].iloc[-1]))
+                if _z:
+                    chip += f"／VIX {float(macd['c'].iloc[-1]):.2f}＝<span style='color:{_z[1]};font-weight:900'>{_z[0]}</span>"
                 if o["target"] == "DC":
                     g1 = f"明日のVIXが <b>{o['x_cross']:.2f}以下（{o['pct']:+.1f}%）</b>でデッドクロス＝上昇転換の目安"
                 else:
