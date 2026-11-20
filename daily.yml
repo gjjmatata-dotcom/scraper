@@ -1,0 +1,20 @@
+name: daily-update
+on:
+  schedule:
+    - cron: "10 21 * * *"      # 毎日 日本時間 6:10（米VIX確定後。GitHubの都合で数十分遅れることあり）
+  workflow_dispatch:           # 手動実行ボタン
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python daily_update.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
