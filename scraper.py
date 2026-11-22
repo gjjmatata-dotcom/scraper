@@ -42,8 +42,9 @@ STOCKS = {
 #     primary key (code, date)
 #   );
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+# 貼り付け時に混ざる前後の空白・改行・引用符を除去（改行入りだと通信ヘッダーが不正になり保存できない）
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().strip("\"'").strip().rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip().strip("\"'").strip()
 _USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
 
 CACHE_FILE   = Path(os.environ.get("PRICE_CACHE_PATH", "price_history_cache.json"))
