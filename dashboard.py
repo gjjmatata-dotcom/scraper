@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from scraper import (fetch_one, fetch_price_by_url, fetch_price_long,
+from scraper import (snapshot_load, fetch_one, fetch_price_by_url, fetch_price_long,
                      calc_technicals, STOCKS, _safe_int_fmt, SHORT_TOPN,
                      estimate_margin_from_lending)
 import socket, re, json, os, requests as _requests
@@ -154,6 +154,21 @@ def _do_fetch(code):
                  {c:wl[c].get("name",c) for c in wl})
     return info,name
 
+def _do_load(code):
+    """保存済みスナップショットから先に表示（ネット取得なし）。保存が無い・壊れている場合だけ通常の取得にする。"""
+    info=None
+    try: info=snapshot_load(code)
+    except Exception as e: print(f"[スナップショット読込失敗] {code}: {e}")
+    if not info:
+        return _do_fetch(code)
+    name=info.get("name") or code
+    info.setdefault("_fetched_at",None)
+    st.session_state.stock_data[code]=info
+    h=st.session_state.search_history
+    if code not in h:
+        st.session_state.search_history=dict(list({code:name,**h}.items())[:10])
+    return info,name
+
 def _save_wl():
     """ウォッチリストの現在の内容を保存（再接続しても同じ銘柄が並ぶように）。"""
     wl_=st.session_state.watch_list
@@ -180,7 +195,7 @@ if hist:
         with hcols[j%5]:
             if st.button(f"＋{hc} {hn}",key=f"h_{hc}"):
                 if hc not in st.session_state.stock_data:
-                    with st.spinner(f"{hc}取得中…"): _do_fetch(hc)
+                    with st.spinner(f"{hc}を読み込み中…"): _do_load(hc)
                 st.session_state.watch_list[hc]={"name":hn}; _save_wl(); st.rerun()
 
 st.caption("📋 デフォルト銘柄")
@@ -189,11 +204,11 @@ for i,(dc,di) in enumerate(STOCKS.items()):
     with dcols[i]:
         if st.button(f"＋{dc} {di['name']}",key=f"def_{dc}"):
             if dc not in st.session_state.stock_data:
-                with st.spinner(f"{dc}取得中…"): _do_fetch(dc)
+                with st.spinner(f"{dc}を読み込み中…"): _do_load(dc)
             st.session_state.watch_list[dc]={"name":di["name"]}; _save_wl(); st.rerun()
 with dcols[len(STOCKS)]:
     if st.button("🔄 全更新"):
-        st.session_state.stock_data.clear(); st.rerun()
+        st.session_state.stock_data.clear(); st.session_state["_force_live"]=True; st.rerun()
 
 wl=st.session_state.watch_list
 if wl:
@@ -208,9 +223,13 @@ st.divider()
 if not wl:
     st.info("銘柄を追加してください。"); st.stop()
 
+_live = bool(st.session_state.pop("_force_live", False))      # 「全更新」の時だけネットから取得
 for code in list(wl.keys()):
     if code not in st.session_state.stock_data:
-        with st.spinner(f"{code} 取得中…"): _do_fetch(code)
+        if _live:
+            with st.spinner(f"{code} 取得中…"): _do_fetch(code)
+        else:
+            with st.spinner(f"{code} 読み込み中…"): _do_load(code)
 
 # ── Plotly共通 ────────────────────────────────────────
 def fig_base(fig, h=380):
@@ -1771,6 +1790,11 @@ def render_stock(code, info, col_hex):
 
     with tab_tech:
         render_technical_section(code,info,col_hex,period_days)
+        try:
+            import signal_stats
+            signal_stats.render(code, info)       # 今日のサインと、同じ状態だった過去の実績（●件中●件）
+        except Exception as _es:
+            st.caption(f"過去実績の表示でエラー: {_es}")
 
     with hdr:
         _tl = st.session_state.get(f"tech_latest_{code}")

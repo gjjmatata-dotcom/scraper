@@ -2512,6 +2512,130 @@ def judge_pressure(lending, price) -> dict:
     if pc>0 and lr<1: return {"label":"🔵 安値買い戻し","detail":"株価上昇＋売り残多（買い戻し）","color":"#388bfd"}
     return {"label":"⚪ 中立","detail":"方向性なし","color":"#8b949e"}
 
+
+# ════════════════════════════════════════
+# 銘柄スナップショット（取得済みデータ一式を1銘柄ずつ保存し、画面を開いた時はこれを先に表示する）
+# ════════════════════════════════════════
+#   ・朝の自動更新(daily_update.py)や「更新」ボタンで fetch_one が走ると、結果一式を保存する
+#   ・画面は、まずこのスナップショットを読んで表示する（ネットからの取得なし）。新しくしたい時だけ更新ボタンで再取得
+#   ・保存形式はJSON(zlib圧縮→base64)。pickleは使わない（保存先から不正なコードを読み込まないため）
+#   ・保存先は既存の蓄積ストアと同じ仕組み(_kv_upsert)。key="snap:コード"、date=1901-01-01から1日ずつ=分割番号
+_SNAP_VER = 1
+_SNAP_CHUNK = 300_000        # 1行あたりの文字数
+
+
+def _snap_enc(o):
+    if isinstance(o, pd.DataFrame):
+        return {"__df__": 1, "cols": [str(c) for c in o.columns],
+                "dt": [str(t) for t in o.dtypes],
+                "data": [[_snap_enc(v) for v in row] for row in o.itertuples(index=False, name=None)]}
+    if isinstance(o, dict):
+        return {"__d__": [[_snap_enc(k), _snap_enc(v)] for k, v in o.items()]}
+    if isinstance(o, (list, tuple)):
+        return [_snap_enc(v) for v in o]
+    if isinstance(o, pd.Timestamp):
+        return {"__ts__": o.isoformat()} if not pd.isna(o) else None
+    if isinstance(o, datetime):
+        return {"__ts__": pd.Timestamp(o).isoformat()}
+    if isinstance(o, (np.bool_, bool)):
+        return bool(o)
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, (np.floating, float)):
+        return float(o)
+    if o is None or isinstance(o, (str, int)):
+        return o
+    if o is pd.NaT:
+        return None
+    return str(o)
+
+
+def _snap_dec(o):
+    if isinstance(o, list):
+        return [_snap_dec(v) for v in o]
+    if isinstance(o, dict):
+        if "__df__" in o:
+            cols = o["cols"]
+            df = pd.DataFrame([[_snap_dec(v) for v in row] for row in o["data"]], columns=cols)
+            for c, t in zip(cols, o["dt"]):
+                try:
+                    if t.startswith("datetime64"):
+                        df[c] = pd.to_datetime(df[c])
+                    elif t.startswith("float"):
+                        df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+                    elif t.startswith("int") and not df[c].isna().any():
+                        df[c] = df[c].astype(t)
+                    elif t == "bool":
+                        df[c] = df[c].astype(bool)
+                except Exception:
+                    pass
+            return df
+        if "__d__" in o:
+            return {_snap_dec(k): _snap_dec(v) for k, v in o["__d__"]}
+        if "__ts__" in o:
+            return pd.Timestamp(o["__ts__"])
+    return o
+
+
+def snapshot_save(code, info: dict) -> bool:
+    """fetch_one の結果一式を保存する。失敗しても例外は出さず False を返す（表示や取得は続行）。"""
+    import base64, zlib
+    try:
+        payload = dict(info)
+        payload["_fetched_at"] = time.time()
+        # 機関空売りが今回取れなかった(サイト側の拒否など)場合は、保存済みの前回分を残す（空で上書きしない）
+        try:
+            si = payload.get("short_inst")
+            if isinstance(si, dict) and len(si.get("raw", [])) == 0:
+                old = snapshot_load(code)
+                osi = (old or {}).get("short_inst")
+                if isinstance(osi, dict) and len(osi.get("raw", [])) > 0:
+                    payload["short_inst"] = osi
+                    print(f"[スナップショット] {code}: 機関空売りは今回取得できなかったため前回保存分を引き継ぎ")
+        except Exception:
+            pass
+        raw = json.dumps({"v": _SNAP_VER, "info": _snap_enc(payload)}, ensure_ascii=False,
+                         separators=(",", ":"), allow_nan=True).encode("utf-8")
+        txt = base64.b64encode(zlib.compress(raw, 6)).decode("ascii")
+        parts = [txt[i:i + _SNAP_CHUNK] for i in range(0, len(txt), _SNAP_CHUNK)] or [""]
+        base = datetime(1901, 1, 1)
+        entries = {(base + timedelta(days=i)).strftime("%Y-%m-%d"): {"b": ptxt, "n": len(parts), "v": _SNAP_VER}
+                   for i, ptxt in enumerate(parts)}
+        _kv_upsert(f"snap:{re.sub(r'[.][A-Z]+$', '', str(code))}", entries)
+        print(f"[スナップショット] {code}: 保存 {len(raw)/1024:.0f}KB → 圧縮{len(txt)/1024:.0f}KB（{len(parts)}分割）")
+        return True
+    except Exception as e:
+        print(f"[スナップショット] {code}: 保存に失敗（処理は続行） {type(e).__name__}: {e}")
+        return False
+
+
+def snapshot_load(code):
+    """保存済みスナップショットを fetch_one と同じ形の辞書で返す。無い・壊れている・版違いは None。"""
+    import base64, zlib
+    try:
+        rows = _kv_load(f"snap:{re.sub(r'[.][A-Z]+$', '', str(code))}") or {}
+        if not rows:
+            return None
+        base = datetime(1901, 1, 1)
+        first = rows.get(base.strftime("%Y-%m-%d"))
+        if not first or first.get("v") != _SNAP_VER:
+            return None
+        n = int(first.get("n", 1))
+        parts = []
+        for i in range(n):
+            r = rows.get((base + timedelta(days=i)).strftime("%Y-%m-%d"))
+            if r is None or r.get("n") != n:      # 保存途中・不整合
+                return None
+            parts.append(r["b"])
+        data = json.loads(zlib.decompress(base64.b64decode("".join(parts))).decode("utf-8"))
+        info = _snap_dec(data["info"])
+        if not isinstance(info, dict) or "price" not in info or "lending" not in info:
+            return None
+        return info
+    except Exception as e:
+        print(f"[スナップショット] {code}: 読込に失敗（通常の取得に切り替えます） {type(e).__name__}: {e}")
+        return None
+
 # ════════════════════════════════════════
 # 単一銘柄取得
 # ════════════════════════════════════════
@@ -2542,5 +2666,7 @@ def fetch_one(code) -> dict:
     except Exception as e:
         print(f"[{code}] 制度信用(JPX): 例外 {e}")
         seido = pd.DataFrame(columns=SEIDO_COLS)
-    return {"name":name,"lending":l,"price":p,"price_long":p_long,
-            "margin":m,"margin_seido":seido,"pressure":judge_pressure(l,p),"short_inst":short_inst}
+    result = {"name":name,"lending":l,"price":p,"price_long":p_long,
+              "margin":m,"margin_seido":seido,"pressure":judge_pressure(l,p),"short_inst":short_inst}
+    snapshot_save(code, result)          # 次回以降、画面はこの保存データを先に表示する
+    return result
