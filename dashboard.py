@@ -1797,6 +1797,11 @@ def render_stock(code, info, col_hex):
             st.caption(f"過去実績の表示でエラー: {_es}")
 
     with hdr:
+        try:
+            import signal_stats
+            signal_stats.banner(code, info)       # 転換サインの段階表示（一番上）
+        except Exception as _eb:
+            st.caption(f"転換サインの表示でエラー: {_eb}")
         _tl = st.session_state.get(f"tech_latest_{code}")
         try:
             _ss = st.session_state

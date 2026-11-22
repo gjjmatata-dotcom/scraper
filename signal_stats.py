@@ -242,6 +242,370 @@ def build(df):
                       "bear": int(bear.iloc[-1]), "bull": int(bull.iloc[-1])}}
 
 
+# ───────── 転換サインの段階表示（画面の一番上のバナー）─────────
+#   ① 敏感サイン（早いが、だましも多い）が2つ以上 → 薄い色
+#   ② ①に加えて、確認サイン（遅いが、確からしい）が1つ以上 → 濃い色（2つ以上で最も濃い）
+#   ③ ②の後に、実際に株価が予想の方向へ動いた（日次ボラの2倍以上）→ 塗りつぶし
+#   外れ: ②の後に、逆方向へ日次ボラの2倍以上動いた → グレー
+SENS_WIN, CONF_WIN, CONFIRM_WIN, MOVE_K, SHOW_WIN = 5, 3, 10, 1.5, 7
+K_OPTIONS = [0.5, 1.0, 1.5, 1.7, 2.0, 2.5, 3.0]
+
+
+def _sar(h, l, af0=0.02, afm=0.2):
+    """パラボリックSAR（標準 0.02/0.2）。戻り値: (sar, 上昇中かどうか)"""
+    h, l = h.values, l.values
+    n = len(h)
+    sar = np.zeros(n)
+    bull = np.ones(n, dtype=bool)
+    sar[0], ep, af, up = l[0], h[0], af0, True
+    for i in range(1, n):
+        v = sar[i - 1] + af * (ep - sar[i - 1])
+        if up:
+            v = min(v, l[i - 1], l[i - 2] if i >= 2 else l[i - 1])
+            if l[i] < v:
+                up, v, ep, af = False, ep, l[i], af0
+            elif h[i] > ep:
+                ep, af = h[i], min(af + af0, afm)
+        else:
+            v = max(v, h[i - 1], h[i - 2] if i >= 2 else h[i - 1])
+            if h[i] > v:
+                up, v, ep, af = True, ep, h[i], af0
+            elif l[i] < ep:
+                ep, af = l[i], min(af + af0, afm)
+        sar[i], bull[i] = v, up
+    return sar, bull
+
+
+def _sticky(flag, w):
+    return flag.astype(int).rolling(w, min_periods=1).max().astype(bool)
+
+
+def _ago(flag, w):
+    """直近w日以内で最後に点灯した日の「何日前か」(0=今日)。無ければ None。"""
+    v = flag.values[-w:]
+    idx = np.where(v)[0]
+    return None if len(idx) == 0 else int(len(v) - 1 - idx[-1])
+
+
+def _make_items(df):
+    """価格データから、敏感サイン・確認サインの日次の点灯表を作る。戻り値: (ok, why, d, c, items)"""
+    if df is None or len(df) < 120 or "終値" not in df.columns:
+        return False, "株価データが120営業日未満", None, None, None
+    d = df.copy()
+    d["_dt"] = pd.to_datetime(d["_dt"])
+    d = d.sort_values("_dt").drop_duplicates("_dt").reset_index(drop=True)
+    c = pd.to_numeric(d["終値"], errors="coerce").astype(float).ffill()
+    if c.isna().mean() > 0.2:
+        return False, "終値の欠けが多い", None, None, None
+    has_hl = all(k in d.columns for k in ("高値", "安値")) and d["高値"].notna().mean() > 0.8
+    h = pd.to_numeric(d["高値"], errors="coerce").astype(float).ffill() if has_hl else None
+    l = pd.to_numeric(d["安値"], errors="coerce").astype(float).ffill() if has_hl else None
+
+    rsi = _rsi(c)
+    macd, sig, hist = _macd(c)
+    pb = _pctb(c)
+    ma25 = c.rolling(25).mean()
+    dev = (c - ma25) / ma25 * 100
+    dsd = float(dev.std()) if dev.notna().sum() > 50 else np.nan
+    zdev = dev / dsd if (dsd == dsd and dsd > 0) else pd.Series(0.0, index=c.index)
+    dv = {("bear", "rsi"): _divergence(c, rsi, "bear", 2.0, peak_min=55),
+          ("bull", "rsi"): _divergence(c, rsi, "bull", 2.0, peak_min=45),
+          ("bear", "macd"): _divergence(c, hist, "bear", 0.0, peak_min=0),
+          ("bull", "macd"): _divergence(c, hist, "bull", 0.0, peak_min=0)}
+    cross_dn = (macd < sig) & (macd.shift() >= sig.shift())
+    cross_up = (macd > sig) & (macd.shift() <= sig.shift())
+    ma_dn = (c < ma25) & (c.shift() >= ma25.shift())
+    ma_up = (c > ma25) & (c.shift() <= ma25.shift())
+    _, sbull = _sar(h, l) if has_hl else (None, None)
+    if has_hl:
+        sb = pd.Series(sbull, index=c.index)
+        sar_dn, sar_up = (~sb) & sb.shift().fillna(True).astype(bool), sb & (~sb.shift().fillna(False).astype(bool))
+        _, pdi, mdi = _adx(h, l, c)
+        di_dn = (mdi > pdi) & (mdi.shift() <= pdi.shift())
+        di_up = (pdi > mdi) & (pdi.shift() <= mdi.shift())
+
+    items = {
+        "bear": {
+            "sens": [("RSI 70以上", rsi >= 70), ("%bが上限の外", pb > 1), ("25日乖離が+1.5σ超", zdev >= 1.5),
+                     ("弱気ダイバージェンス(RSI)", dv[("bear", "rsi")]), ("弱気ダイバージェンス(MACD)", dv[("bear", "macd")])],
+            "conf": [("MACDデッドクロス", cross_dn)]
+                    + ([("SAR陰転", sar_dn), ("DMI 売り方向に逆転", di_dn)] if has_hl else [])},
+        "bull": {
+            "sens": [("RSI 30未満", rsi < 30), ("%bが下限の外", pb < 0), ("25日乖離が−1.5σ未満", zdev <= -1.5),
+                     ("強気ダイバージェンス(RSI)", dv[("bull", "rsi")]), ("強気ダイバージェンス(MACD)", dv[("bull", "macd")])],
+            "conf": [("MACDゴールデンクロス", cross_up)]
+                    + ([("SAR陽転", sar_up), ("DMI 買い方向に逆転", di_up)] if has_hl else [])}}
+
+    return True, "", d, c, items
+
+
+def status(df, K=None):
+    """
+    転換サインの現在の段階（弱気=天井警戒 / 強気=底打ち期待）と、同じ条件の過去実績を返す。
+    戻り値: {ok, why, dirs:{"bear":{...},"bull":{...}}}
+    """
+    K = MOVE_K if K is None else K
+    ok, why, d, c, items = _make_items(df)
+    if not ok:
+        return {"ok": False, "why": why}
+    ret = c.pct_change()
+    sd_d = ret.rolling(60, min_periods=30).std()
+    fwd = {k: c.shift(-k) / c - 1.0 for k in (5, 10)}
+    base_dn = {k: float((fwd[k].dropna() < 0).mean()) for k in (5, 10)}
+    base_up = {k: float((fwd[k].dropna() > 0).mean()) for k in (5, 10)}
+    out = {}
+    for dr in ("bear", "bull"):
+        sgn = -1.0 if dr == "bear" else 1.0
+        S = sum(_sticky(m, SENS_WIN).astype(int) for _, m in items[dr]["sens"])
+        C = sum(_sticky(m, CONF_WIN).astype(int) for _, m in items[dr]["conf"])
+        L1 = S >= 2
+        L2 = L1 & (C >= 1)
+        # ③ 確認: 直近CONFIRM_WIN日以内の②点灯日から、予想方向へ日次ボラの2倍以上動いた
+        L3 = pd.Series(False, index=c.index)
+        MISS = pd.Series(False, index=c.index)
+        for k in range(0, CONFIRM_WIN + 1):
+            mv = sgn * (c / c.shift(k) - 1.0) if k > 0 else pd.Series(0.0, index=c.index)
+            thr = K * sd_d * math.sqrt(max(k, 1))
+            L3 |= L2.shift(k, fill_value=False) & (mv >= thr) & (k > 0)
+            MISS |= L2.shift(k, fill_value=False) & (mv <= -thr) & (k > 0)
+        MISS &= ~L3
+        recent = _sticky(L2, SHOW_WIN)
+        t = len(c) - 1
+        if bool(L3.iloc[t]):
+            lv = 3
+        elif bool(MISS.iloc[t]):
+            lv = -1
+        elif bool(recent.iloc[t]):
+            lv = 2
+        elif bool(L1.iloc[t]):
+            lv = 1
+        else:
+            lv = 0
+        # 点灯日（直近のL2）と、そこからの動き
+        sdate, move, nd = None, None, None
+        v = L2.values[-(CONFIRM_WIN + 1):]
+        idx = np.where(v)[0]
+        if len(idx):
+            k = len(v) - 1 - idx[-1]
+            sdate = d["_dt"].iloc[t - k]
+            move = float(c.iloc[t] / c.iloc[t - k] - 1.0) * 100
+            nd = int(k)
+        # 各段階（①/②/③）の過去実績
+        def _st(m):
+            mm = m.values & fwd[5].notna().values
+            st_ = {}
+            for hh in (5, 10):
+                r = fwd[hh].values
+                ok = m.values & ~np.isnan(r)
+                n = int(ok.sum())
+                k_ = int((r[ok] < 0).sum()) if dr == "bear" else int((r[ok] > 0).sum())
+                st_[hh] = {"n": n, "k": k_, "p": (k_ / n if n else np.nan),
+                           "base": base_dn[hh] if dr == "bear" else base_up[hh]}
+            st_["ep"] = _episodes(np.where(mm)[0])
+            return st_
+        stats_by = {1: _st(L1), 2: _st(L2), 3: _st(L3)}
+        stats = dict(stats_by[lv if lv > 0 else 2])
+        stats["lv_used"] = lv if lv > 0 else 2
+        lit_s = [(nm, _ago(f, SENS_WIN)) for nm, f in items[dr]["sens"] if _ago(f, SENS_WIN) is not None]
+        lit_c = [(nm, _ago(f, CONF_WIN)) for nm, f in items[dr]["conf"] if _ago(f, CONF_WIN) is not None]
+        out[dr] = {"level": lv, "sens": lit_s, "conf": lit_c, "sdate": sdate, "move": move, "days": nd,
+                   "stats": stats, "stats_by": stats_by, "s_now": bool(L1.iloc[t]), "n_sens_total": len(items[dr]["sens"]), "n_conf_total": len(items[dr]["conf"]),
+                   "thr_pct": float(K * (sd_d.iloc[t] if sd_d.iloc[t] == sd_d.iloc[t] else 0.0) * 100)}
+    return {"ok": True, "dirs": out, "d1": d["_dt"].iloc[-1]}
+
+
+
+def calibration(df, ks=None):
+    """
+    ③「実際に動いた」の基準（日次ボラの何倍か）を変えると、どうなるかを過去の②点灯で数える。
+      事例 = ②が新しく点灯した日（連続は1回と数える）
+      確認 = 10営業日以内に、予想方向へ K×日次ボラ×√日数 以上動いた（先に起きた方を採用）
+      外れ = 先に逆方向へ同じだけ動いた ／ 未決 = 10日以内にどちらにも動かなかった
+      確認後の継続 = 確認した日の終値から、さらに5営業日後も予想方向だった割合
+    """
+    ks = ks or K_OPTIONS
+    ok, why, d, c, items = _make_items(df)
+    if not ok:
+        return None
+    ret = c.pct_change()
+    sd = ret.rolling(60, min_periods=30).std().values
+    cv = c.values
+    n = len(cv)
+    ev = []      # (開始日index, 向き符号)
+    for dr, sgn in (("bear", -1.0), ("bull", 1.0)):
+        S = sum(_sticky(m, SENS_WIN).astype(int) for _, m in items[dr]["sens"])
+        C = sum(_sticky(m, CONF_WIN).astype(int) for _, m in items[dr]["conf"])
+        L2 = ((S >= 2) & (C >= 1)).values
+        first = L2 & ~np.concatenate([[False], L2[:-1]])
+        for s0 in np.where(first)[0]:
+            if s0 + CONFIRM_WIN < n:            # 10日先まで観測できる事例だけ
+                ev.append((int(s0), sgn))
+    rows = []
+    for K in ks:
+        conf = miss = pend = 0
+        days, cont, cont_n = [], 0, 0
+        for s0, sgn in ev:
+            res = None
+            for j in range(1, CONFIRM_WIN + 1):
+                mv = sgn * (cv[s0 + j] / cv[s0] - 1.0)
+                thr = K * sd[s0 + j] * math.sqrt(j) if sd[s0 + j] == sd[s0 + j] else np.inf
+                if mv >= thr:
+                    res = ("c", j); break
+                if mv <= -thr:
+                    res = ("m", j); break
+            if res is None:
+                pend += 1
+            elif res[0] == "c":
+                conf += 1
+                days.append(res[1])
+                t = s0 + res[1]
+                if t + 5 < n:
+                    cont_n += 1
+                    cont += int(sgn * (cv[t + 5] / cv[t] - 1.0) > 0)
+            else:
+                miss += 1
+        N = len(ev)
+        rows.append({"K": K, "n": N, "conf": conf, "miss": miss, "pend": pend,
+                     "med_days": (float(np.median(days)) if days else None),
+                     "cont": cont, "cont_n": cont_n})
+    return rows
+
+_BCSS = """<style>
+.sb{border:1px solid #30363d;border-radius:10px;background:#0d1117;padding:10px 12px;margin:6px 0 10px}
+.sb-ttl{font-size:13px;font-weight:800;color:#f0f6fc;margin-bottom:6px}
+.sb-ttl small{font-weight:500;color:#8b949e;margin-left:8px;font-size:11px}
+.sb-row{display:flex;align-items:stretch;gap:8px;margin:6px 0;flex-wrap:wrap}
+.sb-name{min-width:96px;font-size:13px;font-weight:800;display:flex;align-items:center}
+.sb-pill{flex:1;min-width:92px;border-radius:6px;padding:5px 7px;font-size:11px;text-align:center;border:1px solid #30363d;color:#6e7681;background:#161b22;line-height:1.35}
+.sb-pill b{display:block;font-size:12px}
+.sb-det{font-size:11px;color:#8b949e;line-height:1.55;margin:0 0 2px 2px}
+.sb-det b{color:#c9d1d9}
+.sb-chip{display:inline-block;border-radius:6px;padding:3px 8px;margin:2px 6px 2px 0;font-size:12px;border:1px solid #30363d;line-height:1.4}
+.sb-chip small{font-size:10px;opacity:.9}
+.sb-perf{margin:4px 0 2px}
+.sb-cond{font-size:11px;color:#8b949e;display:block;margin-bottom:1px}
+</style>"""
+
+
+def _rgb(dr):
+    return "248,81,73" if dr == "bear" else "88,166,255"
+
+
+def _count_style(dr, step, n, s_ok=True):
+    """① ② のピル。点灯数が多いほど濃くする。②は①が未成立なら薄い破線（確認サインだけ点灯）。"""
+    rgb = _rgb(dr)
+    if step == 1:
+        a = {0: 0.0, 1: 0.07, 2: 0.22, 3: 0.40, 4: 0.58, 5: 0.74}.get(n, 0.74)
+    else:
+        a = {0: 0.0, 1: 0.40, 2: 0.62, 3: 0.80}.get(n, 0.80)
+        if n >= 1 and not s_ok:
+            a = 0.12
+    if a <= 0:
+        return ""
+    dashed = "border-style:dashed;" if (step == 1 and n < 2) or (step == 2 and not s_ok) else ""
+    fg = "#ffffff" if a >= 0.38 else ("#ffb4ae" if dr == "bear" else "#a5d0ff")
+    return f"background:rgba({rgb},{a});border-color:rgba({rgb},{min(1.0, a + .35)});{dashed}color:{fg}"
+
+
+def _step3_style(dr, level):
+    rgb = _rgb(dr)
+    if level == 3:
+        return f"background:rgba({rgb},.92);border-color:rgba({rgb},1);color:#fff"
+    if level == -1:
+        return "background:#21262d;color:#8b949e;border-color:#484f58"
+    if level == 2:
+        return f"border-color:rgba({rgb},.6);color:#c9d1d9"
+    return ""
+
+
+def _dots(n, total):
+    return "●" * n + "○" * (total - n)
+
+
+def _chip(dr, h, s_, ref):
+    """過去実績の1期間分。通常の日との差(pt)で色を付ける: 差が大きい=方向の濃い色／差なし=グレー／逆=橙。"""
+    what = "下落" if dr == "bear" else "上昇"
+    if s_["n"] == 0:
+        return f"<span class='sb-chip' style='color:#6e7681'>{h}日後 該当なし</span>"
+    p, base = s_["p"] * 100, s_["base"] * 100
+    edge = p - base
+    rgb = _rgb(dr)
+    if edge >= 10:
+        st, tag = f"background:rgba({rgb},.55);color:#fff;font-weight:800;border-color:rgba({rgb},.9)", "通常より大きく高い"
+    elif edge >= 5:
+        st, tag = f"background:rgba({rgb},.26);color:#e6edf3;border-color:rgba({rgb},.6)", "やや高い"
+    elif edge > -5:
+        st, tag = "background:#21262d;color:#8b949e", "差なし"
+    else:
+        st, tag = "background:rgba(210,153,34,.28);color:#f0c674;border-color:#d29922", "逆に出ている"
+    if ref:
+        st += ";border-style:dashed;opacity:.85"
+    return (f"<span class='sb-chip' style='{st}'>{h}日後 {what}<b>{p:.0f}%</b> "
+            f"<small>{s_['k']}/{s_['n']}件・通常{base:.0f}%・{edge:+.0f}pt　{tag}</small></span>")
+
+
+def banner(code, info):
+    import streamlit as st
+    df = info.get("price_long")
+    if df is None or len(df) == 0:
+        df = info.get("price")
+    try:
+        r = status(df, K=float(st.session_state.get(f"ss_move_k_{code}", MOVE_K)))
+    except Exception as e:
+        st.caption(f"転換サインの計算でエラー: {e}")
+        return
+    if not r["ok"]:
+        return
+    html = _BCSS + "<div class='sb'><div class='sb-ttl'>🎯 転換サイン<small>" \
+        f"{r['d1']:%m/%d}の終値時点　①敏感サイン(早いがだましも多い) → ②確認サイン(遅いが確か) → ③実際に動いた</small></div>"
+    names = {"bear": ("🔴 天井警戒", "売り転換の兆し"), "bull": ("🔵 底打ち期待", "買い転換の兆し")}
+    for dr in ("bear", "bull"):
+        x = r["dirs"][dr]
+        lv = x["level"]
+        sens = "、".join(f"{n}({'今日' if a == 0 else str(a) + '日前'})" for n, a in x["sens"]) or "なし"
+        conf = "、".join(f"{n}({'今日' if a == 0 else str(a) + '日前'})" for n, a in x["conf"]) or "なし"
+        mv = x["move"]
+        step3 = ("外れ" if lv == -1 else ("確認済み" if lv == 3 else "待ち"))
+        mv_txt = (f"<br>点灯日{x['sdate']:%m/%d}から{mv:+.1f}%" if mv is not None and x["sdate"] is not None else "")
+        ns, nc = len(x["sens"]), len(x["conf"])
+        s_ok = ns >= 2
+        pills = (
+            f"<div class='sb-pill' style='{_count_style(dr, 1, ns)}'><b>① 敏感サイン {ns}/{x['n_sens_total']}個</b>"
+            f"{_dots(ns, x['n_sens_total'])}{'　（2個以上で点灯）' if ns < 2 else ''}</div>"
+            f"<div class='sb-pill' style='{_count_style(dr, 2, nc, s_ok)}'><b>② 確認サイン {nc}/{x['n_conf_total']}個</b>"
+            f"{_dots(nc, x['n_conf_total'])}{('　（①が2個以上のとき有効）' if (nc and not s_ok) else '')}</div>"
+            f"<div class='sb-pill' style='{_step3_style(dr, lv)}'><b>③ 実際に動いた：{step3}</b>"
+            f"{('±' + format(x['thr_pct'], '.1f') + '%で確認') if lv in (2,) else ''}{mv_txt if lv in (2, 3, -1) else ''}</div>")
+        html += (f"<div class='sb-row'><div class='sb-name' style='color:{'#f85149' if dr == 'bear' else '#58a6ff'}'>"
+                 f"{names[dr][0]}</div>{pills}</div>")
+        # 詳細と過去実績
+        det = f"①の内訳: <b>{sens}</b><br>②の内訳: <b>{conf}</b>"
+        what = "下落" if dr == "bear" else "上昇"
+        show = []
+        if x["s_now"]:
+            show.append((1, "今日の①と同じ状態＝敏感サイン2個以上"))
+        if lv == 3:
+            show.append((3, "②のあと予想方向に動いた"))
+        elif lv in (2, -1):
+            show.append((2, "②点灯時と同じ状態＝敏感サイン2個以上＋確認サイン"))
+        for lvu, cond in show:
+            stt = x["stats_by"][lvu]
+            ref = stt[5]["n"] < MIN_N or stt["ep"] < 20
+            chips = "".join(_chip(dr, hh, stt[hh], ref) for hh in (5, 10))
+            det += (f"<div class='sb-perf'><span class='sb-cond'>過去実績［{cond}］　別事例{stt['ep']}回"
+                    f"{'　<span style=color:#d29922>参考(件数少)</span>' if ref else ''}</span>{chips}</div>")
+        if not show and lv == 0:
+            pass
+        if lv == 0 and not x["s_now"]:
+            det += "<br>今は点灯していません。"
+        if lv == -1:
+            det += "<br>※②の点灯後に、逆方向へ大きく動きました（今回のサインは外れ）。"
+        html += f"<div class='sb-det'>{det}</div>"
+    html += ("<div class='sb-det' style='margin-top:6px'>色が濃いほど確からしい段階です。"
+             f"③は日次ボラティリティの{float(st.session_state.get(f'ss_move_k_{code}', MOVE_K)):g}倍以上（日数が増えるほど基準も大きくなります）、予想方向へ動いた時に点灯します。基準は『📊 今日のサインと過去の実績』の下で変えられます。過去の頻度であり、将来を保証するものではありません。</div></div>")
+    st.markdown(html, unsafe_allow_html=True)
+
+
 # ───────── 表示 ─────────
 _CSS = """<style>
 .ss-w{overflow-x:auto;margin:4px 0 10px}
@@ -331,6 +695,35 @@ def render(code, info):
                                 f"<small>{gname}</small><br><b style='color:#f0f6fc'>{row['label']}</b>", 1)
         st.markdown(html, unsafe_allow_html=True)
     st.caption(f"今日同時に出ているサイン: 弱気 {t['bear']}個 / 強気 {t['bull']}個（各5項目）。")
+    with st.expander("③の基準を比べる・変える（日次ボラの何倍で『実際に動いた』とするか）"):
+        key = f"ss_move_k_{code}"
+        cur = float(st.session_state.get(key, MOVE_K))
+        st.selectbox("基準（日次ボラの何倍）", K_OPTIONS, index=(K_OPTIONS.index(cur) if cur in K_OPTIONS else K_OPTIONS.index(MOVE_K)),
+                     key=key, help="小さくすると③が点灯しやすくなりますが、小さな値動きでも「確認済み」になります。")
+        try:
+            cal = calibration(info.get("price_long") if info.get("price_long") is not None and len(info.get("price_long")) else info.get("price"))
+        except Exception as e:
+            cal = None
+            st.caption(f"計算でエラー: {e}")
+        if cal:
+            h = ["基準<br><small>(ボラの○倍)</small>", "②の事例", "確認<br><small>予想どおり</small>", "外れ<br><small>逆に動いた</small>",
+                 "未決<br><small>10日動かず</small>", "確認まで<br><small>中央値</small>", "確認後5日も<br><small>同方向</small>"]
+            t = "<div class='ss-w'><table class='ss-t'><tr>" + "".join(f"<th>{x}</th>" for x in h) + "</tr>"
+            for x in cal:
+                n = max(x["n"], 1)
+                sel = " class='td'" if abs(x["K"] - float(st.session_state.get(key, MOVE_K))) < 1e-9 else ""
+                cont = f"{x['cont']}/{x['cont_n']}件（{x['cont']/x['cont_n']*100:.0f}%）" if x["cont_n"] else "-"
+                md = f"{x['med_days']:.0f}日" if x["med_days"] is not None else "-"
+                t += (f"<tr{sel}><td><b>{x['K']:g}倍</b></td><td>{x['n']}</td>"
+                      f"<td>{x['conf']}件（{x['conf']/n*100:.0f}%）</td><td>{x['miss']}件（{x['miss']/n*100:.0f}%）</td>"
+                      f"<td>{x['pend']}件（{x['pend']/n*100:.0f}%）</td><td>{md}</td><td>{cont}</td></tr>")
+            t += "</table></div>"
+            st.markdown(t, unsafe_allow_html=True)
+            st.caption("②が点灯した過去の各事例を、その後10営業日見た結果です。基準を小さくすると『確認』は増えますが、"
+                       "『外れ』も増え、確認の意味が薄くなります。「確認」が多く「外れ」が少なく、「確認後5日も同方向」が高い基準が良い設定です。"
+                       "事例が少ない銘柄は参考程度に見てください。")
+        else:
+            st.caption("データが足りないため比較できません。")
     with st.expander("すべての状態の実績を見る（指標ごと）"):
         for g in r["groups"]:
             st.markdown(f"<div class='ss-h'>{g['name']}</div>", unsafe_allow_html=True)
