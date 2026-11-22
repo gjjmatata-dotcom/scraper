@@ -1,0 +1,16 @@
+name: wake-render
+on:
+  schedule:
+    - cron: "*/10 21-23 * * *"   # 日本時間 6:00〜8:59 に10分おきでRenderへアクセス（スリープ防止）
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: ping
+        env:
+          URL: ${{ secrets.RENDER_URL }}
+        run: |
+          if [ -z "$URL" ]; then echo "RENDER_URL が未設定です"; exit 0; fi
+          curl -sS -o /dev/null -m 120 -w "status=%{http_code} time=%{time_total}s\n" "$URL/_stcore/health" || true
