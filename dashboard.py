@@ -155,14 +155,20 @@ def _do_fetch(code):
     return info,name
 
 def _do_load(code):
-    """保存済みスナップショットから先に表示（ネット取得なし）。保存が無い・壊れている場合だけ通常の取得にする。"""
+    """保存済みスナップショットから先に表示（ネット取得なし）。保存が無い・壊れている場合だけ通常の取得にする。
+    メモリにすでにある同じ銘柄より、保存データのほうが新しい時だけ置き換える（朝の自動更新の結果を取り込む）。"""
     info=None
     try: info=snapshot_load(code)
     except Exception as e: print(f"[スナップショット読込失敗] {code}: {e}")
+    cur=st.session_state.stock_data.get(code)
     if not info:
+        if cur is not None:
+            return cur,(cur.get("name") or code)
         return _do_fetch(code)
     name=info.get("name") or code
     info.setdefault("_fetched_at",None)
+    if cur is not None and (cur.get("_fetched_at") or 0) >= (info.get("_fetched_at") or 0):
+        return cur,(cur.get("name") or name)
     st.session_state.stock_data[code]=info
     h=st.session_state.search_history
     if code not in h:
@@ -224,12 +230,15 @@ if not wl:
     st.info("銘柄を追加してください。"); st.stop()
 
 _live = bool(st.session_state.pop("_force_live", False))      # 「全更新」の時だけネットから取得
+_seen = st.session_state.setdefault("_snap_seen", set())      # この画面(ブラウザ接続)で、保存データを確認済みの銘柄
 for code in list(wl.keys()):
-    if code not in st.session_state.stock_data:
-        if _live:
+    if _live:
+        if code not in st.session_state.stock_data:
             with st.spinner(f"{code} 取得中…"): _do_fetch(code)
-        else:
-            with st.spinner(f"{code} 読み込み中…"): _do_load(code)
+        _seen.add(code)
+    elif code not in st.session_state.stock_data or code not in _seen:
+        with st.spinner(f"{code} 読み込み中…"): _do_load(code)
+        _seen.add(code)
 
 # ── Plotly共通 ────────────────────────────────────────
 def fig_base(fig, h=380):

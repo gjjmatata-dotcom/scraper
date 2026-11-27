@@ -22,6 +22,14 @@ try:
 except Exception as e:
     print("市場更新で例外:", e)
 
+# ── 1.5) JPX信用残PDFの解析結果を作ってSupabaseへ保存（Renderはメモリが小さいので解析せず、これを読むだけ） ──
+try:
+    _pdfs = S._jpx_list_pdfs()
+    for _d in sorted(_pdfs, reverse=True)[:3]:
+        S._jpx_index_for(_d, _pdfs[_d])
+except Exception as e:
+    print("JPX解析結果の準備で例外:", e)
+
 # ── 2) 個別株（watchlist.txt ＋ persist_state.json の watch_codes） ──
 codes = []
 p = Path("watchlist.txt")

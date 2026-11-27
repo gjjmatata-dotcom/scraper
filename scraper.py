@@ -1622,6 +1622,81 @@ def _jpx_cache_path(date: str) -> Path:
     return JPX_PARSED_DIR / f"{date}.json.gz"
 
 
+def _jpx_payload(date: str, idx: dict, with_diag: bool = True) -> dict:
+    return {
+        "ver": _JPX_PARSER_VER, "date": date,
+        "shs": {isin: {"c": e["code5"], "r": [e["row"][k] for k in _JPX_KEYS] if e["row"] else None}
+                for isin, e in idx["shs"].items()},
+        "val": idx["val"], "diag": idx["diag"] if with_diag else {},
+    }
+
+
+def _jpx_idx_from_payload(p: dict, date: str):
+    if p.get("ver") != _JPX_PARSER_VER or p.get("date") != date:
+        return None
+    shs, shs_code = {}, {}
+    for isin, e in p["shs"].items():
+        row = dict(zip(_JPX_KEYS, e["r"])) if e["r"] else None
+        shs[isin] = {"code5": e["c"], "row": row, "line": -1}
+        if e["c"]:
+            shs_code.setdefault(e["c"], isin)
+    return {"shs": shs, "val": p["val"], "val_line": {}, "shs_code": shs_code, "diag": p.get("diag", {})}
+
+
+def _jpx_remote_save(date: str, idx: dict):
+    """解析結果をSupabaseにも保存する（Render等のWebサーバーはPDFを解析せず、これを読むだけにするため）。"""
+    if not _USE_SUPABASE:
+        return
+    import base64, zlib
+    try:
+        raw = json.dumps(_jpx_payload(date, idx, with_diag=False), ensure_ascii=False,
+                         separators=(",", ":")).encode("utf-8")
+        txt = base64.b64encode(zlib.compress(raw, 9)).decode("ascii")
+        parts = [txt[i:i + _SNAP_CHUNK] for i in range(0, len(txt), _SNAP_CHUNK)] or [""]
+        base = datetime(1901, 1, 1)
+        entries = {(base + timedelta(days=i)).strftime("%Y-%m-%d"): {"b": ptxt, "n": len(parts)}
+                   for i, ptxt in enumerate(parts)}
+        _kv_upsert(f"jpxidx:{date}", entries)
+        print(f"[JPX信用] {date}: 解析結果をSupabaseに保存 {len(txt)/1024:.0f}KB（{len(parts)}分割）")
+    except Exception as e:
+        print(f"[JPX信用] {date}: 解析結果のSupabase保存に失敗（処理は続行） {type(e).__name__}: {e}")
+
+
+def _jpx_remote_load(date: str):
+    """Supabaseに保存された解析結果を読む。無い・壊れている場合はNone。"""
+    if not _USE_SUPABASE:
+        return None
+    import base64, zlib
+    try:
+        rows = _kv_load(f"jpxidx:{date}") or {}
+        if not rows:
+            return None
+        base = datetime(1901, 1, 1)
+        first = rows.get(base.strftime("%Y-%m-%d"))
+        if not first:
+            return None
+        n = int(first.get("n", 1))
+        parts = []
+        for i in range(n):
+            r = rows.get((base + timedelta(days=i)).strftime("%Y-%m-%d"))
+            if r is None or r.get("n") != n:
+                return None
+            parts.append(r["b"])
+        p = json.loads(zlib.decompress(base64.b64decode("".join(parts))).decode("utf-8"))
+        return _jpx_idx_from_payload(p, date)
+    except Exception as e:
+        print(f"[JPX信用] {date}: Supabaseの解析結果の読込に失敗 {type(e).__name__}: {e}")
+        return None
+
+
+def _is_web_server() -> bool:
+    """Render等のWebサーバー上か（メモリが小さいのでPDF全体の解析はしない）。"""
+    return bool(os.environ.get("RENDER") or os.environ.get("JPX_NO_PDF_PARSE"))
+
+
+_jpx_remote_miss: dict = {}     # {date: 確認した時刻}（無いと分かった日付を10分間は再確認しない）
+
+
 def _jpx_cache_save(date: str, idx: dict):
     """全銘柄分の解析結果を保存する（1日あたり数百KB程度）。"""
     if not JPX_PARSED_CACHE:
@@ -1629,12 +1704,7 @@ def _jpx_cache_save(date: str, idx: dict):
     import gzip
     try:
         JPX_PARSED_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "ver": _JPX_PARSER_VER, "date": date,
-            "shs": {isin: {"c": e["code5"], "r": [e["row"][k] for k in _JPX_KEYS] if e["row"] else None}
-                    for isin, e in idx["shs"].items()},
-            "val": idx["val"], "diag": idx["diag"],
-        }
+        payload = _jpx_payload(date, idx)
         path = _jpx_cache_path(date)
         tmp = path.with_suffix(".tmp")
         with gzip.open(tmp, "wt", encoding="utf-8") as f:
@@ -1669,6 +1739,13 @@ def _jpx_cache_load(date: str):
         return None
 
 
+def _jpx_index_put(date: str, idx: dict):
+    """プロセス内キャッシュは新しい2日分だけ残す（全日付を持つとメモリを圧迫するため）。"""
+    _jpx_index_cache[date] = idx
+    while len(_jpx_index_cache) > 2:
+        del _jpx_index_cache[min(_jpx_index_cache)]
+
+
 def _jpx_index_for(date: str, url):
     """
     指定日の索引（全銘柄分）を返す。メモリ → 解析キャッシュ(ディスク) → PDF解析 の順に探す。
@@ -1677,9 +1754,19 @@ def _jpx_index_for(date: str, url):
     if date in _jpx_index_cache:
         return _jpx_index_cache[date]
     idx = _jpx_cache_load(date)
+    if idx is None and time.time() - _jpx_remote_miss.get(date, 0) > 600:
+        idx = _jpx_remote_load(date)
+        if idx is None:
+            _jpx_remote_miss[date] = time.time()
+        else:
+            print(f"[JPX信用] {date}: Supabaseの解析結果を使用（PDF解析なし）")
     if idx is not None:
-        _jpx_index_cache[date] = idx
+        _jpx_index_put(date, idx)
         return idx
+    if _is_web_server():
+        print(f"[JPX信用] {date}: この日付の解析結果はまだありません。メモリ節約のためWebサーバーではPDFを解析しません"
+              f"（毎朝の自動更新で作成されます）")
+        return None
     try:
         import pdfplumber
     except ImportError:
@@ -1691,6 +1778,7 @@ def _jpx_index_for(date: str, url):
         return None
     t0 = time.time()
     lines = []
+    _np_ = 0
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             for page in pdf.pages:
@@ -1699,12 +1787,17 @@ def _jpx_index_for(date: str, url):
                     page.flush_cache()          # ページごとにメモリを解放
                 except Exception:
                     pass
+                _np_ += 1
+                if _np_ % 100 == 0:
+                    import gc; gc.collect()
     except Exception as e:
         print(f"[JPX信用] {date}: PDF解析例外 {e}")
         return None
 
     idx = _jpx_build_index(lines)
     del lines
+    if not (downloaded and JPX_PDF_ARCHIVE):
+        content = None
     n_ok = sum(1 for e in idx["shs"].values() if e["row"])
     print(f"[JPX信用] {date}: PDF解析 {time.time() - t0:.0f}秒 / 株数行{len(idx['shs'])}件（整合OK {n_ok}件）"
           f" / 金額行のコード{len(idx['val'])}件")
@@ -1726,7 +1819,8 @@ def _jpx_index_for(date: str, url):
     if downloaded:
         time.sleep(1.0)            # 連続アクセスの間隔
     _jpx_cache_save(date, idx)
-    _jpx_index_cache[date] = idx
+    _jpx_remote_save(date, idx)
+    _jpx_index_put(date, idx)
     return idx
 
 
@@ -2583,15 +2677,22 @@ def snapshot_save(code, info: dict) -> bool:
     try:
         payload = dict(info)
         payload["_fetched_at"] = time.time()
-        # 機関空売りが今回取れなかった(サイト側の拒否など)場合は、保存済みの前回分を残す（空で上書きしない）
+        # 今回取れなかった項目(サイト側の拒否など)は、保存済みの前回分を残す（空で上書きしない）
         try:
-            si = payload.get("short_inst")
-            if isinstance(si, dict) and len(si.get("raw", [])) == 0:
-                old = snapshot_load(code)
-                osi = (old or {}).get("short_inst")
-                if isinstance(osi, dict) and len(osi.get("raw", [])) > 0:
-                    payload["short_inst"] = osi
-                    print(f"[スナップショット] {code}: 機関空売りは今回取得できなかったため前回保存分を引き継ぎ")
+            def _empty(v):
+                if v is None:
+                    return True
+                if isinstance(v, dict):
+                    return len(v.get("raw", [])) == 0
+                return len(v) == 0
+            need = [k for k in ("lending", "margin", "margin_seido", "short_inst") if _empty(payload.get(k))]
+            if need:
+                old = snapshot_load(code) or {}
+                kept = [k for k in need if not _empty(old.get(k))]
+                for k in kept:
+                    payload[k] = old[k]
+                if kept:
+                    print(f"[スナップショット] {code}: 今回取得できなかった項目は前回保存分を引き継ぎ → {', '.join(kept)}")
         except Exception:
             pass
         raw = json.dumps({"v": _SNAP_VER, "info": _snap_enc(payload)}, ensure_ascii=False,
@@ -2642,12 +2743,16 @@ def snapshot_load(code):
 def fetch_one(code) -> dict:
     name=STOCKS.get(code,{}).get("name") or resolve_name(code) or code
     print(f"\n{'='*40}\n{code} {name}")
-    exists=_irbank_exists(code)
-    if exists:
+    # 貸借(日証金/taisyaku)・信用残(株探)はIRバンクとは別の取得元。IRバンクが404(未対応)・403(アクセス拒否:
+    # GitHub/Renderなどクラウドからは弾かれることがある)でも、取得は試みる。さらに保存済みの蓄積データは必ず統合して返す。
+    # （以前はIRバンクのチェックが200でないと貸借・信用残を丸ごと飛ばし、保存済みデータまで空になっていた）
+    if _code_type(_normalize_jp_code(code)) == "stock_jp":
+        exists=_irbank_exists(code)
+        if not exists:
+            print(f"[{code}] IRバンクは使えません(未対応またはアクセス拒否) → 貸借・信用残は他の取得元と保存済みデータで表示")
         l=fetch_lending(code); time.sleep(1)
         m=fetch_margin(code);  time.sleep(1)
     else:
-        print(f"[{code}] IRバンク未対応 → 貸借・信用残スキップ")
         l=pd.DataFrame(columns=LEND_COLS)
         m=pd.DataFrame(columns=MARGIN_COLS)
     p=fetch_price(code); time.sleep(1)
